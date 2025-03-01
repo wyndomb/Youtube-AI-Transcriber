@@ -65,7 +65,7 @@ export async function POST(request: Request) {
       }
 
       // Truncate transcript if it's too long (OpenAI has token limits)
-      const maxChars = 14000; // Approximately 4000 tokens
+      const maxChars = 42000; // Approximately 12000 tokens
       const truncatedText =
         transcriptText.length > maxChars
           ? transcriptText.slice(0, maxChars) + "..."
