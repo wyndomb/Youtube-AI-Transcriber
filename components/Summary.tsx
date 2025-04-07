@@ -1,7 +1,9 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "react-hot-toast";
+import { DocumentDuplicateIcon } from "@heroicons/react/24/outline";
+import { PodcastMetadata } from "./PodcastMetadata";
 
 interface SummaryProps {
   summary: string;
@@ -9,9 +11,74 @@ interface SummaryProps {
 }
 
 const Summary: React.FC<SummaryProps> = ({ summary, videoUrl }) => {
+  const [metadata, setMetadata] = useState<PodcastMetadata | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  // Fetch metadata if it's not already in the summary
+  useEffect(() => {
+    const fetchMetadata = async () => {
+      if (!videoUrl) return;
+
+      try {
+        setLoading(true);
+        const response = await fetch("/api/podcast-metadata", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ url: videoUrl }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          setMetadata(data.metadata);
+        }
+      } catch (error) {
+        console.error("Error fetching metadata:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchMetadata();
+  }, [videoUrl]);
+
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(summary);
+      // Include metadata in the copied content if available
+      let fullContent = "";
+
+      if (metadata) {
+        fullContent += `# ${metadata.title}\n`;
+        fullContent += `Channel: ${metadata.channelName}\n`;
+        fullContent += `Duration: ${metadata.duration}\n`;
+
+        // Add published date if available
+        if (metadata.publishedAt) {
+          const date = new Date(metadata.publishedAt);
+          fullContent += `Published: ${date.toLocaleDateString()}\n`;
+        }
+
+        // Add view count if available
+        if (metadata.viewCount) {
+          fullContent += `Views: ${parseInt(
+            metadata.viewCount
+          ).toLocaleString()}\n`;
+        }
+
+        // Add like count if available
+        if (metadata.likeCount) {
+          fullContent += `Likes: ${parseInt(
+            metadata.likeCount
+          ).toLocaleString()}\n`;
+        }
+
+        fullContent += "\n";
+      }
+
+      fullContent += summary;
+
+      await navigator.clipboard.writeText(fullContent);
       toast.success("Summary copied to clipboard!");
     } catch (error) {
       console.error("Failed to copy:", error);
@@ -20,66 +87,25 @@ const Summary: React.FC<SummaryProps> = ({ summary, videoUrl }) => {
   };
 
   return (
-    <div className="bg-white rounded-lg shadow-lg p-6 max-w-4xl mx-auto my-4">
-      <div className="mb-4 flex justify-between items-center">
-        <h2 className="text-xl font-semibold text-gray-700">Podcast Summary</h2>
-        <div className="flex gap-2">
-          <button
-            onClick={handleCopy}
-            className="px-3 py-1 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 flex items-center"
-            aria-label="Copy summary to clipboard"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              className="h-4 w-4 mr-1"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"
-              />
-            </svg>
-            Copy
-          </button>
-          <button
-            onClick={() => {
-              window.open(videoUrl, "_blank", "noopener,noreferrer");
-            }}
-            className="px-3 py-1 text-sm bg-blue-50 text-blue-700 rounded hover:bg-blue-100 flex items-center"
-            aria-label="Open video in new tab"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              className="h-4 w-4 mr-1"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"
-              />
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-              />
-            </svg>
-            Video
-          </button>
-        </div>
+    <div className="bg-white rounded-lg">
+      <div className="flex justify-end p-2">
+        <button
+          onClick={handleCopy}
+          className="flex items-center px-3 py-1.5 text-sm bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+          aria-label="Copy summary to clipboard"
+        >
+          <DocumentDuplicateIcon className="h-4 w-4 mr-1.5" />
+          Copy
+        </button>
       </div>
 
-      <div className="border-t pt-4">
-        <div className="markdown-content max-h-96 overflow-y-auto pr-2">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{summary}</ReactMarkdown>
+      <div className="px-4 pb-4 overflow-y-auto max-h-[70vh]">
+        {/* Metadata section has been removed */}
+
+        <div className="w-full max-w-full overflow-hidden markdown-content bg-gray-50 border border-gray-200 rounded-lg p-6 py-0">
+          <div className="prose prose-lg !max-w-full !w-full prose-headings:text-purple-700 prose-h1:text-2xl prose-h2:text-xl prose-h2:mt-8 prose-h2:mb-4 prose-h2:pb-2 prose-h2:border-b prose-h2:border-gray-200 prose-h3:text-lg prose-h3:text-gray-700 prose-h3:mt-6 prose-p:text-gray-600 prose-p:my-4 prose-p:leading-relaxed prose-ul:my-4 prose-ol:my-4 prose-li:my-1.5 prose-li:text-gray-600 prose-strong:text-purple-800 prose-strong:font-medium prose-a:text-purple-600 prose-a:no-underline hover:prose-a:underline">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{summary}</ReactMarkdown>
+          </div>
         </div>
       </div>
     </div>

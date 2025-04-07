@@ -12,6 +12,40 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Helper function to fetch podcast metadata
+const fetchPodcastMetadata = async (videoId: string) => {
+  try {
+    // We need to use a fully qualified URL in server components
+    // Since we need to make an internal API call, construct the URL based on the request URL
+    // This is a self-request to our own API endpoint
+    const origin = process.env.VERCEL_URL
+      ? `https://${process.env.VERCEL_URL}`
+      : process.env.NODE_ENV === "development"
+      ? "http://localhost:3000"
+      : "";
+
+    const response = await fetch(`${origin}/api/podcast-metadata`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch metadata: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.metadata;
+  } catch (error) {
+    console.error("Error fetching podcast metadata:", error);
+    return null;
+  }
+};
+
 export async function POST(request: Request) {
   try {
     // Parse request body
@@ -39,6 +73,10 @@ export async function POST(request: Request) {
     }
 
     console.log("Extracted video ID:", videoId);
+
+    // Fetch podcast metadata
+    const metadata = await fetchPodcastMetadata(videoId);
+    console.log("Fetched metadata:", metadata);
 
     // Get transcript
     try {
@@ -80,6 +118,12 @@ export async function POST(request: Request) {
       // Generate summary using OpenAI
       try {
         console.log("Calling OpenAI API...");
+
+        // Prepare metadata information for the prompt
+        const metadataInfo = metadata
+          ? `Video Title: ${metadata.title}\nChannel: ${metadata.channelName}\nDuration: ${metadata.duration}\n\n`
+          : "";
+
         const completion = await openai.chat.completions.create({
           messages: [
             {
@@ -91,7 +135,7 @@ Output Format (in Markdown):
    Give a quick overview of what the podcast was about - the main vibes and key points. Make it 2 paragraphs. Keep it conversational and engaging.
 
 2. ## Key Insights
-   Identify and explain the most important ideas, revelations, or arguments presented in the podcast. Generate 5-7 points.For each one:
+   Identify and explain the most important ideas, revelations, or arguments presented in the podcast. Generate 5-7 points. For each one:
    - Explain it in a casual, friendly way yet insightful
    - Why it's worth thinking about
    - Add a timestamp if you can find one
@@ -122,7 +166,9 @@ Guidelines:
             },
             {
               role: "user",
-              content: `Please analyze the following podcast transcript and provide a summary according to the specified format:\n\n${truncatedText}`,
+              content: `Please analyze the following podcast transcript and provide a summary according to the specified format:
+
+${metadataInfo}${truncatedText}`,
             },
           ],
           model: "gpt-4o-mini",
@@ -152,6 +198,15 @@ Guidelines:
           .trim();
 
         console.log("Summary length:", formattedSummary.length, "characters");
+
+        // Return both the summary and metadata if available
+        if (metadata) {
+          return NextResponse.json({
+            summary: formattedSummary,
+            metadata: metadata,
+          });
+        }
+
         return NextResponse.json({ summary: formattedSummary });
       } catch (openaiError: any) {
         console.error("OpenAI API Error:", {
