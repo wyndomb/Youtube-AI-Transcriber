@@ -29,30 +29,114 @@ async function fetchYouTubeTranscriptDirectly(videoId: string) {
           Accept:
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         },
+        // Add timeout to prevent hanging requests
+        signal: AbortSignal.timeout(15000), // 15 second timeout
       }
     );
 
     if (!videoPageResponse.ok) {
       throw new Error(
-        `Failed to fetch video page: ${videoPageResponse.status}`
+        `Failed to fetch video page: ${videoPageResponse.status} ${videoPageResponse.statusText}`
       );
     }
 
+    // Check content type to ensure we got HTML
+    const contentType = videoPageResponse.headers.get("content-type");
+    if (!contentType || !contentType.includes("text/html")) {
+      throw new Error(`Invalid content type returned: ${contentType}`);
+    }
+
     const videoPageContent = await videoPageResponse.text();
+
+    // Check if we got a meaningful response
+    if (!videoPageContent || videoPageContent.length < 1000) {
+      throw new Error("Empty or too short response from YouTube");
+    }
 
     // Extract captions data from the page
     const captionsMatch = videoPageContent.match(
       /"captions":(.*?),"videoDetails"/
     );
-    if (!captionsMatch || !captionsMatch[1]) {
+
+    // If the first pattern doesn't match, try alternative patterns
+    let captionsData;
+    let rawCaptionsData = null;
+
+    if (captionsMatch && captionsMatch[1]) {
+      rawCaptionsData = captionsMatch[1];
+    } else {
+      // Try alternative pattern
+      const altCaptionsMatch = videoPageContent.match(
+        /\\"captionTracks\\":(\[.*?\])/
+      );
+
+      if (altCaptionsMatch && altCaptionsMatch[1]) {
+        // Directly create a structure compatible with our existing code
+        console.log(`[${videoId}] Found captions using alternative pattern 1`);
+
+        try {
+          // Clean the JSON string before parsing
+          const cleanedAltJson = altCaptionsMatch[1]
+            .replace(/\\"/g, '"')
+            .replace(/\\\\u/g, "\\u")
+            .replace(/\\\\/g, "\\");
+
+          const captionTracks = JSON.parse(cleanedAltJson);
+
+          if (captionTracks && captionTracks.length > 0) {
+            // Create a structure compatible with our existing code
+            rawCaptionsData = JSON.stringify({
+              playerCaptionsTracklistRenderer: {
+                captionTracks: captionTracks,
+              },
+            });
+          }
+        } catch (parseError) {
+          console.error(
+            `[${videoId}] Failed to parse alternative captions data:`,
+            parseError
+          );
+        }
+      }
+
+      // If still no match, try a third pattern that looks for direct baseUrl
+      if (!rawCaptionsData) {
+        const thirdPatternMatch = videoPageContent.match(
+          /\\"baseUrl\\":\\"(https:\/\/www\.youtube\.com\/api\/timedtext[^"\\]*)/
+        );
+
+        if (thirdPatternMatch && thirdPatternMatch[1]) {
+          console.log(
+            `[${videoId}] Found captions using alternative pattern 2`
+          );
+
+          // Extract the URL and decode it
+          const transcriptUrl = thirdPatternMatch[1]
+            .replace(/\\u0026/g, "&")
+            .replace(/\\\\/g, "\\");
+
+          // Create a compatible structure with the URL directly
+          rawCaptionsData = JSON.stringify({
+            playerCaptionsTracklistRenderer: {
+              captionTracks: [
+                {
+                  baseUrl: transcriptUrl,
+                },
+              ],
+            },
+          });
+        }
+      }
+    }
+
+    if (!rawCaptionsData) {
       throw new Error("No captions data found in video page");
     }
 
     // Parse captions data
-    let captionsData;
     try {
       // Clean up the JSON string before parsing
-      const cleanedJson = captionsMatch[1]
+      const cleanedJson = rawCaptionsData
         .replace(/\\"/g, '"')
         .replace(/\\\\/g, "\\");
       captionsData = JSON.parse(cleanedJson);
@@ -79,15 +163,22 @@ async function fetchYouTubeTranscriptDirectly(videoId: string) {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
       },
+      // Add timeout to prevent hanging requests
+      signal: AbortSignal.timeout(10000), // 10 second timeout
     });
 
     if (!transcriptResponse.ok) {
       throw new Error(
-        `Failed to fetch transcript data: ${transcriptResponse.status}`
+        `Failed to fetch transcript data: ${transcriptResponse.status} ${transcriptResponse.statusText}`
       );
     }
 
     const transcriptXml = await transcriptResponse.text();
+
+    // Validate that we received proper XML data
+    if (!transcriptXml || !transcriptXml.includes("<transcript>")) {
+      throw new Error("Invalid transcript data received");
+    }
 
     // Parse the XML to extract transcript
     const regex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
@@ -366,12 +457,25 @@ ${metadataInfo}${truncatedText}`,
         // Consider logging more properties if available, e.g., error code
         stack: transcriptError.stack,
       });
-      return NextResponse.json(
-        {
-          error: `Failed to fetch video transcript: ${transcriptError.message}`,
-        },
-        { status: 404 }
-      );
+
+      // Provide more user-friendly error messages based on the error
+      let userErrorMessage = `Failed to fetch video transcript: ${transcriptError.message}`;
+
+      if (
+        transcriptError.message.includes("No captions data found") ||
+        transcriptError.message.includes("Transcript is disabled") ||
+        transcriptError.message.includes("No transcript tracks available")
+      ) {
+        userErrorMessage =
+          "This video doesn't have captions or transcripts available. Please try a different YouTube video that has captions enabled.";
+      } else if (
+        transcriptError.message.includes("Failed to fetch video page")
+      ) {
+        userErrorMessage =
+          "Unable to access this YouTube video. The video might be private, restricted, or no longer available.";
+      }
+
+      return NextResponse.json({ error: userErrorMessage }, { status: 404 });
     }
   } catch (error: any) {
     console.error("General Error:", {

@@ -14,6 +14,7 @@ This document outlines our systematic approach to resolving the YouTube transcri
 3. **Library Compatibility**: The transcript fetching library might not be compatible with Vercel's serverless environment
 4. **Authentication/Headers**: The requests from Vercel might be missing necessary headers or user-agent information
 5. **Server vs. Client Execution**: The code might be executing in a different context (client vs server) on Vercel
+6. **YouTube Page Structure**: The structure of YouTube pages might be different when accessed from Vercel's IP ranges
 
 ## Action Plan
 
@@ -39,10 +40,12 @@ This document outlines our systematic approach to resolving the YouTube transcri
 
 ## Current Diagnosis
 
-Initial diagnosis indicated that the YouTube API key was missing from the Vercel environment. This was added, but the issue persisted. Further investigation revealed two key issues:
+Initial diagnosis indicated that the YouTube API key was missing from the Vercel environment. This was added, but the issue persisted. Further investigation revealed several key issues:
 
 1. The URL construction for internal API calls was missing the proper protocol prefix on Vercel deployments
 2. YouTube transcript fetching may be blocked by YouTube when coming from Vercel IP addresses
+3. YouTube returns different page structures when accessed from cloud providers vs. residential IPs
+4. The regex pattern used to extract captions data was failing on certain videos
 
 ## Implemented Solution
 
@@ -52,6 +55,9 @@ We've addressed these issues with a multi-faceted approach:
 2. Fixed the URL construction for internal API calls to include the proper protocol
 3. Implemented a custom fallback method for transcript fetching that uses a direct approach with browser-like headers
 4. Added retry logic to try multiple methods of fetching transcripts
+5. Implemented multiple regex patterns to extract captions from different YouTube page structures
+6. Added timeout handling for HTTP requests to prevent hanging in error cases
+7. Improved error handling and user-facing error messages
 
 ### Phase 2: Initial Fixes
 
@@ -72,22 +78,41 @@ We've addressed these issues with a multi-faceted approach:
   - [x] Improve error messages shown to users
   - [x] Deploy and test
 
-### Phase 3: Alternative Approaches (If Needed)
+### Phase 3: Advanced Fixes (Implemented)
 
-- [ ] **3.1 Try Official YouTube API**
+- [x] **3.1 Multiple Regex Patterns**
+
+  - [x] Implement multiple regex patterns to handle different YouTube page structures
+  - [x] Create fallback mechanisms to try alternative extraction methods
+  - [x] Add specific error handling for each extraction method
+
+- [x] **3.2 Request Improvements**
+
+  - [x] Add timeout handling to prevent hanging requests
+  - [x] Validate response content types and structures
+  - [x] Add more detailed error reporting
+
+- [x] **3.3 User Experience**
+  - [x] Improve user-facing error messages
+  - [x] Add specific guidance for videos without captions
+  - [x] Handle edge cases more gracefully
+
+### Phase 4: Future Alternatives (If Needed)
+
+- [ ] **4.1 Try Official YouTube API**
 
   - [ ] Set up YouTube Data API credentials
   - [ ] Implement transcript fetching using official API
   - [ ] Add as environment variable to Vercel
   - [ ] Deploy and test
 
-- [ ] **3.2 Alternative Libraries**
+- [ ] **4.2 Alternative Libraries**
 
   - [ ] Research alternative YouTube transcript libraries
   - [ ] Implement a selected alternative
   - [ ] Deploy and test
 
-- [ ] **3.3 Proxy Solution**
+- [ ] **4.3 Proxy Solution**
   - [ ] Create a proxy API endpoint that forwards requests to YouTube
   - [ ] Configure to mask server origins and appear as browser requests
   - [ ] Deploy and test
@@ -102,12 +127,14 @@ For the implemented solution:
    - One with auto-generated captions
    - One in a non-English language
 3. Monitor logs for any errors
+4. Test with the specific video ID that previously failed: b9gPwO-IsB4
 
 ## Success Criteria
 
 - Application successfully retrieves transcripts for videos that have them available
 - Application properly handles and communicates when transcripts are unavailable
 - Solution works consistently across multiple videos and over time
+- User receives helpful error messages when transcripts cannot be fetched
 
 ## Implementation Notes
 
