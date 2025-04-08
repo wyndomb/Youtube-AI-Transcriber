@@ -80,11 +80,14 @@ export async function POST(request: Request) {
 
     // Get transcript
     try {
-      console.log("Fetching transcript for video ID:", videoId);
+      console.log(`[${videoId}] Attempting to fetch transcript...`);
       const transcript = await YoutubeTranscript.fetchTranscript(videoId);
+      console.log(
+        `[${videoId}] Raw transcript response received. Length: ${transcript?.length}`
+      );
 
       if (!transcript || transcript.length === 0) {
-        console.error("No transcript found for video ID:", videoId);
+        console.error(`[${videoId}] No transcript data found in the response.`);
         return NextResponse.json(
           { error: "No transcript found for this video" },
           { status: 404 }
@@ -92,10 +95,12 @@ export async function POST(request: Request) {
       }
 
       const transcriptText = transcript.map((item) => item.text).join(" ");
-      console.log("Transcript length:", transcriptText.length, "characters");
+      console.log(
+        `[${videoId}] Transcript processed. Text length: ${transcriptText.length}`
+      );
 
       if (!transcriptText || transcriptText.trim() === "") {
-        console.error("Empty transcript for video ID:", videoId);
+        console.error(`[${videoId}] Processed transcript text is empty.`);
         return NextResponse.json(
           { error: "Empty transcript found for this video" },
           { status: 404 }
@@ -110,9 +115,7 @@ export async function POST(request: Request) {
           : transcriptText;
 
       console.log(
-        "Truncated transcript length:",
-        truncatedText.length,
-        "characters"
+        `[${videoId}] Truncated transcript text length: ${truncatedText.length}`
       );
 
       // Generate summary using OpenAI
@@ -223,8 +226,10 @@ ${metadataInfo}${truncatedText}`,
         );
       }
     } catch (transcriptError: any) {
-      console.error("Transcript Error:", {
+      console.error(`[${videoId}] Transcript Fetching Error:`, {
         message: transcriptError.message,
+        name: transcriptError.name,
+        // Consider logging more properties if available, e.g., error code
         stack: transcriptError.stack,
       });
       return NextResponse.json(

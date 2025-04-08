@@ -51,11 +51,16 @@ export async function POST(request: Request) {
 
     // Get transcript
     try {
-      console.log("Fetching transcript for video ID:", videoId);
+      console.log(`[${videoId}] Attempting to fetch transcript for chat...`);
       const transcript = await YoutubeTranscript.fetchTranscript(videoId);
+      console.log(
+        `[${videoId}] Raw transcript response received for chat. Length: ${transcript?.length}`
+      );
 
       if (!transcript || transcript.length === 0) {
-        console.error("No transcript found for video ID:", videoId);
+        console.error(
+          `[${videoId}] No transcript data found in the response for chat.`
+        );
         return NextResponse.json(
           { error: "No transcript found for this video" },
           { status: 404 }
@@ -63,10 +68,14 @@ export async function POST(request: Request) {
       }
 
       const transcriptText = transcript.map((item) => item.text).join(" ");
-      console.log("Transcript length:", transcriptText.length, "characters");
+      console.log(
+        `[${videoId}] Transcript processed for chat. Text length: ${transcriptText.length}`
+      );
 
       if (!transcriptText || transcriptText.trim() === "") {
-        console.error("Empty transcript for video ID:", videoId);
+        console.error(
+          `[${videoId}] Processed transcript text is empty for chat.`
+        );
         return NextResponse.json(
           { error: "Empty transcript found for this video" },
           { status: 404 }
@@ -81,9 +90,7 @@ export async function POST(request: Request) {
           : transcriptText;
 
       console.log(
-        "Truncated transcript length:",
-        truncatedText.length,
-        "characters"
+        `[${videoId}] Truncated transcript text length for chat: ${truncatedText.length}`
       );
 
       // Prepare chat history for the API
@@ -150,8 +157,10 @@ Here's the podcast transcript: ${truncatedText}`,
         );
       }
     } catch (transcriptError: any) {
-      console.error("Transcript Error:", {
+      console.error(`[${videoId}] Transcript Fetching Error (Chat):`, {
         message: transcriptError.message,
+        name: transcriptError.name,
+        // Consider logging more properties if available, e.g., error code
         stack: transcriptError.stack,
       });
       return NextResponse.json(
