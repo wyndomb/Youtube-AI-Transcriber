@@ -5,7 +5,10 @@ This document outlines our systematic approach to resolving the YouTube transcri
 ## Current Issue
 
 - ✅ Application works correctly in local development environment
-- ❌ Application fails on Vercel deployment with error: `Failed to fetch video transcript: [YoutubeTranscript] 🚨 Transcript is disabled on this video`
+- ❌ Application fails on Vercel deployment with multiple errors:
+  - `Failed to fetch video transcript: [YoutubeTranscript] 🚨 Transcript is disabled on this video`
+  - `Failed to fetch metadata: Unauthorized`
+  - `No captions data found in video page`
 
 ## Hypotheses
 
@@ -15,28 +18,8 @@ This document outlines our systematic approach to resolving the YouTube transcri
 4. **Authentication/Headers**: The requests from Vercel might be missing necessary headers or user-agent information
 5. **Server vs. Client Execution**: The code might be executing in a different context (client vs server) on Vercel
 6. **YouTube Page Structure**: The structure of YouTube pages might be different when accessed from Vercel's IP ranges
-
-## Action Plan
-
-### Phase 1: Diagnosis and Information Gathering
-
-- [x] **1.1 Examine Current Implementation**
-
-  - [x] Locate the transcript fetching code in the codebase (`app/api/summarize/route.ts`, `app/api/chat/route.ts`)
-  - [x] Identify which library/method is being used (`youtube-transcript` v1.0.6, method: `YoutubeTranscript.fetchTranscript(videoId)`)
-  - [x] Determine if fetching happens on client or server side (Server-side via Next.js API routes)
-
-- [x] **1.2 Basic Vercel Debugging**
-
-  - [x] Add verbose logging to transcript fetching code
-  - [x] Deploy to Vercel and check logs for additional error information
-  - [x] Test with multiple known-good YouTube videos to confirm the pattern
-  - [x] **FINDING**: Error `Failed to fetch metadata: Unauthorized` points to missing YouTube API key in Vercel environment
-
-- [x] **1.3 Environment Comparison**
-  - [x] Document Node.js version in local vs Vercel (Vercel: Node.js 18.x, Local: Node.js 20.x)
-  - [x] Check for environment variables that might affect behavior (YOUTUBE_API_KEY is set in local but was missing in Vercel)
-  - [x] Compare package versions between environments (youtube-transcript v1.0.6 in both environments)
+7. **API Key Issues**: The YouTube API key might not be properly configured in Vercel or might have restrictions
+8. **Page Format Changes**: YouTube might be serving different HTML formats for different client types
 
 ## Current Diagnosis
 
@@ -46,6 +29,7 @@ Initial diagnosis indicated that the YouTube API key was missing from the Vercel
 2. YouTube transcript fetching may be blocked by YouTube when coming from Vercel IP addresses
 3. YouTube returns different page structures when accessed from cloud providers vs. residential IPs
 4. The regex pattern used to extract captions data was failing on certain videos
+5. The podcast metadata API was failing with an "Unauthorized" error, likely due to YouTube API key issues or restrictions
 
 ## Implemented Solution
 
@@ -58,64 +42,44 @@ We've addressed these issues with a multi-faceted approach:
 5. Implemented multiple regex patterns to extract captions from different YouTube page structures
 6. Added timeout handling for HTTP requests to prevent hanging in error cases
 7. Improved error handling and user-facing error messages
+8. Added direct fallbacks for podcast metadata using oEmbed instead of the YouTube API
+9. Implemented YouTube's Innertube API approach for transcript fetching as a new fallback method
+10. Provided more robust error handling to present useful information to the user even when transcripts can't be fetched
 
-### Phase 2: Initial Fixes
+### Phase 1: Initial Diagnosis & Fixes
 
-- [x] **2.1 Server-Side Implementation**
+✅ Identified missing API keys and URL construction issues
 
-  - [x] Improve the server-side transcript fetching code with a robust fallback solution
-  - [x] Add proper error handling with specific error types
-  - [x] Deploy and test
+### Phase 2: First Iteration of Solutions
 
-- [x] **2.2 CORS Handling**
+✅ Improved the server-side transcript fetching code with a robust fallback solution
+✅ Added proper error handling with specific error types
+✅ Added browser-like headers to all requests
 
-  - [x] Add appropriate browser-like headers to requests
-  - [x] Use a proper user-agent string
-  - [x] Deploy and test
+### Phase 3: Enhanced Approach (Latest)
 
-- [x] **2.3 Error Handling Improvements**
-  - [x] Add graceful fallbacks for when transcripts aren't available
-  - [x] Improve error messages shown to users
-  - [x] Deploy and test
+✅ **3.1 Multiple Approach Strategy**
 
-### Phase 3: Advanced Fixes (Implemented)
+- Implemented 4 different methods to get transcripts: standard library, direct fetch, YouTube API, and Innertube API
+- Added cascading fallbacks to try all methods before failing
+- Improved regex patterns for all extraction methods
 
-- [x] **3.1 Multiple Regex Patterns**
+✅ **3.2 API Key & Authentication**
 
-  - [x] Implement multiple regex patterns to handle different YouTube page structures
-  - [x] Create fallback mechanisms to try alternative extraction methods
-  - [x] Add specific error handling for each extraction method
+- Added fallbacks for when the YouTube API key is missing or restricted
+- Implemented direct oEmbed approach for metadata that doesn't require API key
 
-- [x] **3.2 Request Improvements**
+✅ **3.3 Enhanced Error Handling**
 
-  - [x] Add timeout handling to prevent hanging requests
-  - [x] Validate response content types and structures
-  - [x] Add more detailed error reporting
+- Improved error classification and user-friendly messages
+- Return metadata even when transcript fetching fails
+- Added specific handling for different error types
 
-- [x] **3.3 User Experience**
-  - [x] Improve user-facing error messages
-  - [x] Add specific guidance for videos without captions
-  - [x] Handle edge cases more gracefully
+✅ **3.4 YouTube Innertube API**
 
-### Phase 4: Future Alternatives (If Needed)
-
-- [ ] **4.1 Try Official YouTube API**
-
-  - [ ] Set up YouTube Data API credentials
-  - [ ] Implement transcript fetching using official API
-  - [ ] Add as environment variable to Vercel
-  - [ ] Deploy and test
-
-- [ ] **4.2 Alternative Libraries**
-
-  - [ ] Research alternative YouTube transcript libraries
-  - [ ] Implement a selected alternative
-  - [ ] Deploy and test
-
-- [ ] **4.3 Proxy Solution**
-  - [ ] Create a proxy API endpoint that forwards requests to YouTube
-  - [ ] Configure to mask server origins and appear as browser requests
-  - [ ] Deploy and test
+- Implemented YouTube's internal API approach for transcript fetching
+- Added multiple patterns for extracting necessary tokens from the page
+- Included fallbacks at every level of the process
 
 ## Monitoring and Validation
 
@@ -128,6 +92,7 @@ For the implemented solution:
    - One in a non-English language
 3. Monitor logs for any errors
 4. Test with the specific video ID that previously failed: b9gPwO-IsB4
+5. Check if metadata is returned even when transcript fetching fails
 
 ## Success Criteria
 
@@ -135,12 +100,27 @@ For the implemented solution:
 - Application properly handles and communicates when transcripts are unavailable
 - Solution works consistently across multiple videos and over time
 - User receives helpful error messages when transcripts cannot be fetched
+- Basic functionality continues to work even when some components fail (graceful degradation)
+
+## Future Enhancements (If Needed)
+
+- [ ] **YouTube Data API for Captions**
+
+  - Explore the use of the official YouTube Data API to fetch captions (requires OAuth)
+  - This would be more reliable but more complex to implement
+
+- [ ] **Alternative Libraries**
+
+  - Research and test alternative YouTube transcript libraries
+  - Evaluate newer libraries that might handle server-side environments better
+
+- [ ] **Proxy Solution**
+  - Create a proxy API endpoint that forwards requests to YouTube from a non-Vercel IP
+  - Consider using a serverless function on a different provider or a dedicated server
 
 ## Implementation Notes
 
-- Document all attempted solutions
-- For each attempt, note exactly what changed and the results
-- Track any new error messages or behaviors
+Each attempted solution has significantly improved our resilience and error handling. Our current approach tries multiple methods before failing, provides clear error messages, and gracefully degrades by providing metadata even when transcripts can't be fetched.
 
 ## Rollback Plan
 
