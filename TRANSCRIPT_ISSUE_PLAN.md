@@ -25,38 +25,54 @@ This document outlines our systematic approach to resolving the YouTube transcri
   - [x] Identify which library/method is being used (`youtube-transcript` v1.0.6, method: `YoutubeTranscript.fetchTranscript(videoId)`)
   - [x] Determine if fetching happens on client or server side (Server-side via Next.js API routes)
 
-- [ ] **1.2 Basic Vercel Debugging**
+- [x] **1.2 Basic Vercel Debugging**
 
-  - [ ] Add verbose logging to transcript fetching code
-  - [ ] Deploy to Vercel and check logs for additional error information
-  - [ ] Test with multiple known-good YouTube videos to confirm the pattern
+  - [x] Add verbose logging to transcript fetching code
+  - [x] Deploy to Vercel and check logs for additional error information
+  - [x] Test with multiple known-good YouTube videos to confirm the pattern
+  - [x] **FINDING**: Error `Failed to fetch metadata: Unauthorized` points to missing YouTube API key in Vercel environment
 
-- [ ] **1.3 Environment Comparison**
-  - [ ] Document Node.js version in local vs Vercel
-  - [ ] Check for any environment variables that might affect behavior
-  - [ ] Compare package versions between environments
+- [x] **1.3 Environment Comparison**
+  - [x] Document Node.js version in local vs Vercel (Vercel: Node.js 18.x, Local: Node.js 20.x)
+  - [x] Check for environment variables that might affect behavior (YOUTUBE_API_KEY is set in local but was missing in Vercel)
+  - [x] Compare package versions between environments (youtube-transcript v1.0.6 in both environments)
+
+## Current Diagnosis
+
+Initial diagnosis indicated that the YouTube API key was missing from the Vercel environment. This was added, but the issue persisted. Further investigation revealed two key issues:
+
+1. The URL construction for internal API calls was missing the proper protocol prefix on Vercel deployments
+2. YouTube transcript fetching may be blocked by YouTube when coming from Vercel IP addresses
+
+## Implemented Solution
+
+We've addressed these issues with a multi-faceted approach:
+
+1. Added more detailed logging to track down the exact point of failure
+2. Fixed the URL construction for internal API calls to include the proper protocol
+3. Implemented a custom fallback method for transcript fetching that uses a direct approach with browser-like headers
+4. Added retry logic to try multiple methods of fetching transcripts
 
 ### Phase 2: Initial Fixes
 
-- [ ] **2.1 Server-Side Implementation**
+- [x] **2.1 Server-Side Implementation**
 
-  - [ ] Create dedicated API route for transcript fetching if not already present
-  - [ ] Ensure transcript fetching occurs server-side in a Next.js API route
-  - [ ] Add proper error handling with specific error types
-  - [ ] Deploy and test
+  - [x] Improve the server-side transcript fetching code with a robust fallback solution
+  - [x] Add proper error handling with specific error types
+  - [x] Deploy and test
 
-- [ ] **2.2 CORS Handling**
+- [x] **2.2 CORS Handling**
 
-  - [ ] Add appropriate CORS headers to requests
-  - [ ] Use a proper user-agent string
-  - [ ] Deploy and test
+  - [x] Add appropriate browser-like headers to requests
+  - [x] Use a proper user-agent string
+  - [x] Deploy and test
 
-- [ ] **2.3 Error Handling Improvements**
-  - [ ] Add graceful fallbacks for when transcripts aren't available
-  - [ ] Improve error messages shown to users
-  - [ ] Deploy and test
+- [x] **2.3 Error Handling Improvements**
+  - [x] Add graceful fallbacks for when transcripts aren't available
+  - [x] Improve error messages shown to users
+  - [x] Deploy and test
 
-### Phase 3: Alternative Approaches
+### Phase 3: Alternative Approaches (If Needed)
 
 - [ ] **3.1 Try Official YouTube API**
 
@@ -76,22 +92,16 @@ This document outlines our systematic approach to resolving the YouTube transcri
   - [ ] Configure to mask server origins and appear as browser requests
   - [ ] Deploy and test
 
-### Phase 4: External Service Integration (if needed)
-
-- [ ] **4.1 Third-Party Transcript Services**
-  - [ ] Evaluate services like AssemblyAI, Rev.ai, etc.
-  - [ ] Implement integration with selected service
-  - [ ] Deploy and test
-
 ## Monitoring and Validation
 
-For each implementation step:
+For the implemented solution:
 
 1. Deploy to Vercel
 2. Test with at least 3 different YouTube videos:
    - One with known captions
    - One with auto-generated captions
    - One in a non-English language
+3. Monitor logs for any errors
 
 ## Success Criteria
 

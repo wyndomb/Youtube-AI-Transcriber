@@ -24,6 +24,7 @@ This document outlines the steps to deploy the application to Vercel.
       - `OPENAI_API_KEY`: Enter your OpenAI API key. Mark it as **Secret**.
       - `NEXT_PUBLIC_SUPABASE_URL`: Enter your Supabase project URL.
       - `NEXT_PUBLIC_SUPABASE_ANON_KEY`: Enter your Supabase Anon Key.
+      - `YOUTUBE_API_KEY`: Enter your YouTube Data API key. Mark it as **Secret**.
     - _Note: The `NEXT_PUBLIC_` prefixes are required for the Supabase variables to be accessible in the browser.\_
 
 ## 4. Deploy

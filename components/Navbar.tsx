@@ -91,6 +91,12 @@ const Navbar = () => {
                 Dashboard
               </Link>
             )}
+            <Link
+              href="/validate-transcript"
+              className="text-gray-600 hover:text-purple-600 transition-colors"
+            >
+              Validate Transcript
+            </Link>
             <span className="text-sm text-gray-600 hidden sm:inline">
               {session.user.email}
             </span>
@@ -102,12 +108,20 @@ const Navbar = () => {
             </button>
           </>
         ) : (
-          <button
-            onClick={handleSignIn}
-            className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors flex items-center space-x-2"
-          >
-            <span>Sign In with Google</span>
-          </button>
+          <>
+            <Link
+              href="/validate-transcript"
+              className="text-gray-600 hover:text-purple-600 transition-colors mr-4"
+            >
+              Validate Transcript
+            </Link>
+            <button
+              onClick={handleSignIn}
+              className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors flex items-center space-x-2"
+            >
+              <span>Sign In with Google</span>
+            </button>
+          </>
         )}
       </div>
     </nav>
