@@ -21,6 +21,143 @@ function parseTimestamp(timestamp: string): number {
   return isNaN(seconds) ? 0 : seconds; // Return 0 if parsing fails
 }
 
+// Enhanced headers to better mimic a real browser
+const getBrowserLikeHeaders = () => {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "document",
+    "sec-ch-ua":
+      '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "Upgrade-Insecure-Requests": "1",
+    Referer: "https://www.youtube.com/",
+    "Cache-Control": "max-age=0",
+  };
+};
+
+// Storage for cookies and session data between requests
+let cookieJar = "";
+let consentToken = "";
+
+// Simple cache for HTML content by videoId
+const htmlCache: Record<string, { html: string; timestamp: number }> = {};
+const CACHE_TTL = 60 * 1000; // 1 minute cache
+
+// Helper function to establish YouTube session and get initial cookies
+async function establishYouTubeSession(): Promise<boolean> {
+  try {
+    // Reset cookie jar for a fresh session
+    cookieJar = "";
+
+    // Initial touch to get YouTube cookies and possibly consent page
+    const initialResponse = await fetch("https://www.youtube.com/", {
+      headers: getBrowserLikeHeaders(),
+      signal: AbortSignal.timeout(10000),
+      redirect: "follow",
+    });
+
+    // Save cookies from initial request
+    const setCookieHeader = initialResponse.headers.get("set-cookie");
+    if (setCookieHeader) {
+      cookieJar = setCookieHeader;
+
+      // Look for and process consent tokens if available
+      const html = await initialResponse.text();
+      const consentMatch = html.match(/consent.youtube.com\/[^"]+/);
+      if (consentMatch) {
+        const consentUrl = `https://${consentMatch[0]}`;
+        await processConsentPage(consentUrl);
+      }
+
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.warn(`Failed to establish YouTube session: ${error}`);
+    return false;
+  }
+}
+
+// Helper function to handle YouTube consent pages
+async function processConsentPage(consentUrl: string): Promise<void> {
+  try {
+    // First fetch the consent page
+    const consentPageResponse = await fetch(consentUrl, {
+      headers: {
+        ...getBrowserLikeHeaders(),
+        ...(cookieJar ? { Cookie: cookieJar } : {}),
+      },
+      redirect: "follow",
+    });
+
+    // Update cookies
+    const consentCookies = consentPageResponse.headers.get("set-cookie");
+    if (consentCookies) {
+      cookieJar = consentCookies;
+    }
+
+    // Parse the consent page
+    const consentHtml = await consentPageResponse.text();
+
+    // Find the form data needed for consent
+    const formMatch = consentHtml.match(/<form[^>]*>[\s\S]*?<\/form>/i);
+    if (formMatch) {
+      // Extract form action URL
+      const actionMatch = formMatch[0].match(/action="([^"]+)"/);
+      const formAction = actionMatch ? actionMatch[1] : "";
+
+      // Extract hidden fields - fix for TypeScript compatibility
+      const hiddenFieldRegex =
+        /<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/g;
+      const formData = new URLSearchParams();
+
+      // Use a regular RegExp.exec approach instead of matchAll
+      let hiddenMatch;
+      while ((hiddenMatch = hiddenFieldRegex.exec(formMatch[0])) !== null) {
+        formData.append(hiddenMatch[1], hiddenMatch[2]);
+      }
+
+      // Add consent selection (agree to all)
+      formData.append("consent_submitted", "true");
+      formData.append("continue", "https://www.youtube.com/");
+      formData.append("bl", "boq_identityfrontenduiserver_20231128.03_p0");
+      formData.append("hl", "en");
+      formData.append("consent_ack", "yes");
+      formData.append("consent_hl", "en");
+      formData.append("consent_gac", "1");
+
+      // Submit the consent form
+      const submitResponse = await fetch(formAction || consentUrl, {
+        method: "POST",
+        headers: {
+          ...getBrowserLikeHeaders(),
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...(cookieJar ? { Cookie: cookieJar } : {}),
+        },
+        body: formData.toString(),
+        redirect: "follow",
+      });
+
+      // Update cookies once more
+      const submitCookies = submitResponse.headers.get("set-cookie");
+      if (submitCookies) {
+        cookieJar = submitCookies;
+        console.log("Processed YouTube consent page successfully");
+      }
+    }
+  } catch (error) {
+    console.warn(`Failed to process consent page: ${error}`);
+  }
+}
+
 // Extracts caption data from HTML, finds URL, fetches, and parses transcript
 async function extractAndParseTranscriptFromHtml(
   html: string,
@@ -137,13 +274,17 @@ async function extractAndParseTranscriptFromHtml(
   // Fetch the transcript XML/TTML
   const transcriptResponse = await fetch(transcriptUrl, {
     headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9",
-      Accept: "*/*",
+      ...getBrowserLikeHeaders(),
+      ...(cookieJar ? { Cookie: cookieJar } : {}),
     },
     signal: AbortSignal.timeout(10000),
   });
+
+  // Save cookies for future requests
+  const setCookieHeader = transcriptResponse.headers.get("set-cookie");
+  if (setCookieHeader) {
+    cookieJar = setCookieHeader;
+  }
 
   if (!transcriptResponse.ok) {
     const errorText = await transcriptResponse.text();
@@ -256,17 +397,129 @@ async function fetchTranscriptDirect(
   videoId: string
 ): Promise<TranscriptLine[] | null> {
   console.log(`[${videoId}] Attempting Direct Fetch Strategy...`);
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-  };
 
   try {
+    // Check if we already have a session, if not establish one
+    if (!cookieJar) {
+      console.log(
+        `[${videoId}] No active session, establishing YouTube session first...`
+      );
+      await establishYouTubeSession();
+    }
+
+    // Check cache first
+    if (
+      htmlCache[videoId] &&
+      Date.now() - htmlCache[videoId].timestamp < CACHE_TTL
+    ) {
+      console.log(`[${videoId}] Using cached HTML content`);
+      const transcript = await extractAndParseTranscriptFromHtml(
+        htmlCache[videoId].html,
+        videoId
+      );
+      if (transcript) {
+        return transcript;
+      }
+      // If parsing failed with cached content, clear cache and try fresh fetch
+      delete htmlCache[videoId];
+    }
+
+    // Random delay to mimic human behavior (100-300ms)
+    await new Promise((resolve) =>
+      setTimeout(resolve, 100 + Math.random() * 200)
+    );
+
+    // Log request headers for debugging
+    const requestHeaders = {
+      ...getBrowserLikeHeaders(),
+      ...(cookieJar ? { Cookie: cookieJar } : {}),
+    };
+    console.log(
+      `[${videoId}] Request headers (subset): User-Agent=${requestHeaders[
+        "User-Agent"
+      ]?.substring(0, 30)}..., Accept-Language=${
+        requestHeaders["Accept-Language"]
+      }, Cookie=${cookieJar ? "Set" : "Not set"}`
+    );
+
+    // Main video page request with cookies
     const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers,
-      signal: AbortSignal.timeout(15000), // Add timeout
+      headers: requestHeaders,
+      signal: AbortSignal.timeout(15000),
     });
+
+    // Log response details for debugging
+    console.log(
+      `[${videoId}] YouTube response status: ${response.status}, URL: ${
+        response.url
+      }, Content-Type: ${response.headers.get("content-type")}`
+    );
+
+    // Check if we were redirected to consent page
+    const finalUrl = response.url;
+    if (finalUrl.includes("consent.youtube.com")) {
+      console.log(`[${videoId}] Redirected to consent page, processing...`);
+      await processConsentPage(finalUrl);
+
+      // Retry the main request after consent
+      console.log(
+        `[${videoId}] Retrying main request after processing consent...`
+      );
+      const retryResponse = await fetch(
+        `https://www.youtube.com/watch?v=${videoId}`,
+        {
+          headers: {
+            ...getBrowserLikeHeaders(),
+            ...(cookieJar ? { Cookie: cookieJar } : {}),
+          },
+          signal: AbortSignal.timeout(15000),
+        }
+      );
+
+      // Log retry response details
+      console.log(
+        `[${videoId}] Retry response status: ${retryResponse.status}, URL: ${retryResponse.url}`
+      );
+
+      // Update cookies from the retry response
+      const retryCookies = retryResponse.headers.get("set-cookie");
+      if (retryCookies) {
+        cookieJar = retryCookies;
+      }
+
+      // Continue with this response
+      if (!retryResponse.ok) {
+        throw new Error(
+          `Failed to fetch video page after consent: ${retryResponse.status}`
+        );
+      }
+
+      const html = await retryResponse.text();
+      // Log HTML size and check for key markers
+      console.log(
+        `[${videoId}] Received HTML size: ${
+          html.length
+        }, Contains captions data: ${html.includes(
+          "captionTracks"
+        )}, Contains player data: ${html.includes("ytInitialPlayerResponse")}`
+      );
+
+      // Cache the HTML content
+      htmlCache[videoId] = { html, timestamp: Date.now() };
+
+      // Continue with parsing
+      const transcript = await extractAndParseTranscriptFromHtml(html, videoId);
+      if (!transcript) {
+        throw new Error("Transcript extraction/parsing failed after consent");
+      }
+      return transcript;
+    }
+
+    // Update cookies from the video page response
+    const videoPageCookies = response.headers.get("set-cookie");
+    if (videoPageCookies) {
+      cookieJar = videoPageCookies;
+    }
 
     if (!response.ok) {
       throw new Error(
@@ -297,6 +550,18 @@ async function fetchTranscriptDirect(
       );
     }
 
+    // Log HTML content diagnostics
+    console.log(
+      `[${videoId}] HTML content length: ${
+        html.length
+      }, Contains captions data: ${html.includes(
+        "captionTracks"
+      )}, Contains player data: ${html.includes("ytInitialPlayerResponse")}`
+    );
+
+    // Update cache with the fresh HTML
+    htmlCache[videoId] = { html, timestamp: Date.now() };
+
     // Call the combined extraction and parsing function
     const transcript = await extractAndParseTranscriptFromHtml(html, videoId);
 
@@ -326,18 +591,26 @@ async function fetchTranscriptInnertube(
   videoId: string
 ): Promise<TranscriptLine[] | null> {
   console.log(`[${videoId}] Attempting Innertube API Strategy...`);
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-  };
 
   try {
-    // 1. Fetch Initial Page Content (similar to Direct, might be needed for Innertube keys/context)
+    // 1. Fetch Initial Page Content with enhanced headers
     const initialResponse = await fetch(
       `https://www.youtube.com/watch?v=${videoId}`,
-      { headers, signal: AbortSignal.timeout(15000) }
+      {
+        headers: {
+          ...getBrowserLikeHeaders(),
+          ...(cookieJar ? { Cookie: cookieJar } : {}),
+        },
+        signal: AbortSignal.timeout(15000),
+      }
     );
+
+    // Update cookies from this response
+    const setCookieHeader = initialResponse.headers.get("set-cookie");
+    if (setCookieHeader) {
+      cookieJar = setCookieHeader;
+    }
+
     if (!initialResponse.ok) {
       throw new Error(
         `Innertube initial page fetch failed: ${initialResponse.status} ${initialResponse.statusText}`
@@ -379,17 +652,31 @@ async function fetchTranscriptInnertube(
       )}..., Version: ${INNERTUBE_CONTEXT.client.clientVersion}`
     );
 
-    // 3. Make the Innertube API request for player data
+    // 3. Make the Innertube API request with enhanced headers
     const playerApiUrl = `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}`;
     const playerApiResponse = await fetch(playerApiUrl, {
       method: "POST",
       headers: {
-        ...headers,
+        ...getBrowserLikeHeaders(),
         "Content-Type": "application/json",
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": INNERTUBE_CONTEXT.client.clientVersion,
+        ...(cookieJar ? { Cookie: cookieJar } : {}),
       },
-      body: JSON.stringify({ context: INNERTUBE_CONTEXT, videoId: videoId }),
+      body: JSON.stringify({
+        context: INNERTUBE_CONTEXT,
+        videoId: videoId,
+        contentCheckOk: true,
+        racyCheckOk: true,
+      }),
       signal: AbortSignal.timeout(10000),
     });
+
+    // Update cookies from this API response
+    const apiCookies = playerApiResponse.headers.get("set-cookie");
+    if (apiCookies) {
+      cookieJar = apiCookies;
+    }
 
     if (!playerApiResponse.ok) {
       const errorText = await playerApiResponse.text();
@@ -453,16 +740,20 @@ async function fetchTranscriptInnertube(
       )}...`
     );
 
-    // 6. Fetch and Parse the Transcript XML/TTML (identical logic to direct fetch)
+    // 6. Fetch the transcript with enhanced headers
     const transcriptResponse = await fetch(transcriptUrl, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        Accept: "*/*",
+        ...getBrowserLikeHeaders(),
+        ...(cookieJar ? { Cookie: cookieJar } : {}),
       },
       signal: AbortSignal.timeout(10000),
     });
+
+    // Update cookies again
+    const transcriptCookies = transcriptResponse.headers.get("set-cookie");
+    if (transcriptCookies) {
+      cookieJar = transcriptCookies;
+    }
 
     if (!transcriptResponse.ok) {
       const errorText = await transcriptResponse.text();
@@ -573,7 +864,10 @@ async function fetchTranscriptInnertube(
       try {
         const initialResponse = await fetch(
           `https://www.youtube.com/watch?v=${videoId}`,
-          { headers, signal: AbortSignal.timeout(15000) }
+          {
+            headers: getBrowserLikeHeaders(),
+            signal: AbortSignal.timeout(15000),
+          }
         );
         if (initialResponse.ok) {
           const html = await initialResponse.text();
