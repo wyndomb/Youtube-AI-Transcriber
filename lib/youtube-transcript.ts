@@ -1,3 +1,38 @@
+interface TranscriptLine {
+  text: string;
+  duration: number;
+  offset: number;
+}
+
+// Placeholder - Implement or move the actual logic from summarize route
+function extractCaptionsFromHtml(html: string): TranscriptLine[] | null {
+  console.error("[Placeholder] extractCaptionsFromHtml needs implementation!");
+  // Add logic here to parse HTML and extract JSON/XML data
+  // Example using regex (adapt based on actual implementation):
+  /*
+  const captionsMatch = html.match(/"captions":(.*?),"videoDetails"/);
+  if (!captionsMatch || !captionsMatch[1]) {
+    return null;
+  }
+  try {
+    const rawJson = captionsMatch[1];
+    // ... further parsing and formatting ...
+    return []; // Return formatted TranscriptLine array
+  } catch (e) {
+    console.error("Error parsing captions in placeholder:", e);
+    return null;
+  }
+  */
+  return null; // Return null until implemented
+}
+
+// Placeholder - Implement or move if needed for TTML parsing
+function parseTimestamp(timestamp: string): number {
+  console.error("[Placeholder] parseTimestamp needs implementation!");
+  // Logic to parse HH:MM:SS.ms or other formats
+  return 0;
+}
+
 async function fetchTranscriptDirect(
   videoId: string
 ): Promise<TranscriptLine[]> {
@@ -25,10 +60,6 @@ async function fetchTranscriptDirect(
     return captionsJson;
   } catch (error) {
     console.error("[Direct Fetch Error] Failed to parse captions JSON:", error);
-    console.error(
-      "[Direct Fetch Debug] HTML Snippet (first 1000 chars):",
-      html.substring(0, 1000)
-    );
     throw new Error("Could not find or parse captions JSON in HTML");
   }
 }
