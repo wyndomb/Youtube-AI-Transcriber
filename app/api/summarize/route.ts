@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
-import { YoutubeTranscript } from "youtube-transcript";
+import { YoutubeTranscript, TranscriptConfig } from "youtube-transcript";
 import OpenAI from "openai";
+import { fetchMetadataFromYouTubeAPI } from "@/lib/youtube";
+import { PodcastMetadata } from "@/components/PodcastMetadata";
 
 // Check if OpenAI API key is set
 if (!process.env.OPENAI_API_KEY) {
@@ -12,12 +14,63 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Custom function to fetch YouTube transcript directly
-// This serves as a fallback if the youtube-transcript library fails
-async function fetchYouTubeTranscriptDirectly(videoId: string) {
-  try {
-    console.log(`[${videoId}] Attempting direct transcript fetch...`);
+// Define a simple type for oEmbed response (can be shared or redefined)
+interface OEmbedResponse {
+  title?: string;
+  author_name?: string;
+  thumbnail_url?: string;
+}
 
+// Simple oEmbed fetch function (can be shared or redefined) - adjusted for this context
+async function fetchOEmbedMetadataForSummarize(
+  videoId: string
+): Promise<Partial<PodcastMetadata> | null> {
+  const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+  try {
+    console.log(
+      `[${videoId}] (Summarize) Attempting oEmbed fallback for metadata...`
+    );
+    const response = await fetch(url, {
+      next: { revalidate: 3600 },
+      signal: AbortSignal.timeout(8000),
+    }); // Cache & 8s timeout
+    if (!response.ok) {
+      console.error(
+        `[${videoId}] (Summarize) oEmbed request failed with status ${response.status} ${response.statusText}`
+      );
+      return null;
+    }
+    const data: OEmbedResponse = await response.json();
+    const metadata: Partial<PodcastMetadata> = {
+      videoId: videoId,
+      title: data.title || "YouTube Video (oEmbed)",
+      channelName: data.author_name || "Unknown Channel (oEmbed)",
+      thumbnails: data.thumbnail_url
+        ? { default: { url: data.thumbnail_url, width: 0, height: 0 } }
+        : null,
+      duration: "0:00", // oEmbed doesn't provide duration
+    };
+    console.log(
+      `[${videoId}] (Summarize) Successfully fetched partial metadata via oEmbed fallback.`
+    );
+    return metadata;
+  } catch (error: any) {
+    if (error.name === "AbortError") {
+      console.error(`[${videoId}] (Summarize) oEmbed request timed out.`);
+    } else {
+      console.error(
+        `[${videoId}] (Summarize) Error fetching oEmbed metadata:`,
+        error.message || error
+      );
+    }
+    return null;
+  }
+}
+
+// Custom function to fetch YouTube transcript directly
+async function fetchYouTubeTranscriptDirectly(videoId: string) {
+  console.log(`[${videoId}] Attempting direct transcript fetch...`);
+  try {
     // First, fetch the video page to extract necessary tokens
     const videoPageResponse = await fetch(
       `https://www.youtube.com/watch?v=${videoId}`,
@@ -29,7 +82,6 @@ async function fetchYouTubeTranscriptDirectly(videoId: string) {
           Accept:
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         },
-        // Add timeout to prevent hanging requests
         signal: AbortSignal.timeout(15000), // 15 second timeout
       }
     );
@@ -40,885 +92,1143 @@ async function fetchYouTubeTranscriptDirectly(videoId: string) {
       );
     }
 
-    // Check content type to ensure we got HTML
     const contentType = videoPageResponse.headers.get("content-type");
     if (!contentType || !contentType.includes("text/html")) {
-      throw new Error(`Invalid content type returned: ${contentType}`);
+      // Sometimes YouTube might return JSON even on direct page request, handle this
+      if (contentType.includes("application/json")) {
+        console.warn(
+          `[${videoId}] Direct fetch received JSON instead of HTML. Content might be blocked or page structure changed.`
+        );
+        // Optionally try to parse JSON for errors if relevant
+      } else {
+        throw new Error(`Invalid content type returned: ${contentType}`);
+      }
     }
 
     const videoPageContent = await videoPageResponse.text();
 
-    // Check if we got a meaningful response
-    if (!videoPageContent || videoPageContent.length < 1000) {
-      throw new Error("Empty or too short response from YouTube");
+    if (!videoPageContent || videoPageContent.length < 500) {
+      // Increased threshold slightly
+      throw new Error(
+        `Empty or too short response from YouTube (Length: ${videoPageContent?.length})`
+      );
     }
 
-    // Extract captions data from the page
-    const captionsMatch = videoPageContent.match(
-      /"captions":(.*?),"videoDetails"/
-    );
-
-    // If the first pattern doesn't match, try alternative patterns
-    let captionsData;
+    // --- Start Regex Extraction ---
     let rawCaptionsData = null;
+    const patterns = [
+      /"captions":\s*(\{.*?"captionTracks":.*?\}),\s*"videoDetails"/, // Main pattern
+      /"captionTracks":\s*(\[.*?\])/, // Simpler track array
+      /"baseUrl":"(https:\/\/www\.youtube\.com\/api\/timedtext.*?)"/, // Corrected: Reduced escaping for slashes
+    ];
 
-    if (captionsMatch && captionsMatch[1]) {
-      rawCaptionsData = captionsMatch[1];
-    } else {
-      // Try alternative pattern
-      const altCaptionsMatch = videoPageContent.match(
-        /\\"captionTracks\\":(\[.*?\])/
-      );
-
-      if (altCaptionsMatch && altCaptionsMatch[1]) {
-        // Directly create a structure compatible with our existing code
-        console.log(`[${videoId}] Found captions using alternative pattern 1`);
-
-        try {
-          // Clean the JSON string before parsing
-          const cleanedAltJson = altCaptionsMatch[1]
-            .replace(/\\"/g, '"')
-            .replace(/\\\\u/g, "\\u")
-            .replace(/\\\\/g, "\\");
-
-          const captionTracks = JSON.parse(cleanedAltJson);
-
-          if (captionTracks && captionTracks.length > 0) {
-            // Create a structure compatible with our existing code
-            rawCaptionsData = JSON.stringify({
-              playerCaptionsTracklistRenderer: {
-                captionTracks: captionTracks,
-              },
-            });
-          }
-        } catch (parseError) {
-          console.error(
-            `[${videoId}] Failed to parse alternative captions data:`,
-            parseError
-          );
-        }
-      }
-
-      // If still no match, try a third pattern that looks for direct baseUrl
-      if (!rawCaptionsData) {
-        const thirdPatternMatch = videoPageContent.match(
-          /\\"baseUrl\\":\\"(https:\/\/www\.youtube\.com\/api\/timedtext[^"\\]*)/
+    for (const pattern of patterns) {
+      const match = videoPageContent.match(pattern);
+      if (match && match[1]) {
+        const matchedData = match[1]
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, "\\"); // Basic cleaning
+        console.log(
+          `[${videoId}] Found potential captions data using pattern: ${pattern.source.substring(
+            0,
+            30
+          )}...`
         );
 
-        if (thirdPatternMatch && thirdPatternMatch[1]) {
-          console.log(
-            `[${videoId}] Found captions using alternative pattern 2`
-          );
-
-          // Extract the URL and decode it
-          const transcriptUrl = thirdPatternMatch[1]
-            .replace(/\\u0026/g, "&")
-            .replace(/\\\\/g, "\\");
-
-          // Create a compatible structure with the URL directly
+        if (pattern.source.includes("baseUrl")) {
+          // Handle direct URL pattern
+          // Decode URL-encoded characters
+          const decodedUrl = decodeURIComponent(JSON.parse(`"${matchedData}"`)); // Safer decoding
           rawCaptionsData = JSON.stringify({
             playerCaptionsTracklistRenderer: {
-              captionTracks: [
-                {
-                  baseUrl: transcriptUrl,
-                },
-              ],
+              captionTracks: [{ baseUrl: decodedUrl }],
             },
           });
+          console.log(`[${videoId}] Extracted direct transcript URL.`);
+        } else {
+          // Attempt to parse as JSON for other patterns
+          try {
+            // More robust cleaning might be needed depending on YouTube's output
+            const parsed = JSON.parse(matchedData);
+            // Ensure structure is somewhat valid before accepting
+            if (
+              parsed &&
+              (parsed.captionTracks ||
+                (parsed.playerCaptionsTracklistRenderer &&
+                  parsed.playerCaptionsTracklistRenderer.captionTracks))
+            ) {
+              // Re-stringify into a consistent format if needed, or use directly if structure matches
+              if (
+                parsed.captionTracks &&
+                !parsed.playerCaptionsTracklistRenderer
+              ) {
+                rawCaptionsData = JSON.stringify({
+                  playerCaptionsTracklistRenderer: {
+                    captionTracks: parsed.captionTracks,
+                  },
+                });
+              } else {
+                rawCaptionsData = JSON.stringify(parsed); // Assume structure is okay
+              }
+              console.log(`[${videoId}] Successfully parsed extracted JSON.`);
+            } else {
+              console.warn(
+                `[${videoId}] Parsed JSON has unexpected structure.`
+              );
+            }
+          } catch (parseError) {
+            console.warn(
+              `[${videoId}] Failed to parse extracted data for pattern ${pattern.source.substring(
+                0,
+                30
+              )}...: ${parseError}`
+            );
+            // Continue to next pattern
+          }
         }
+        if (rawCaptionsData) break; // Stop if valid data found
       }
     }
+    // --- End Regex Extraction ---
 
     if (!rawCaptionsData) {
+      console.error(
+        `[${videoId}] No captions data found in video page using any pattern.`
+      );
+      // Optional: Log a snippet of the page for debugging (be careful with size/PII)
+      // console.log(`[${videoId}] Page Snippet: ${videoPageContent.substring(0, 500)}`);
       throw new Error("No captions data found in video page");
     }
 
-    // Parse captions data
+    let captionsData;
     try {
-      // Clean up the JSON string before parsing
-      const cleanedJson = rawCaptionsData
-        .replace(/\\"/g, '"')
-        .replace(/\\\\/g, "\\");
-      captionsData = JSON.parse(cleanedJson);
+      captionsData = JSON.parse(rawCaptionsData); // Already cleaned during extraction
     } catch (e: any) {
-      throw new Error(`Failed to parse captions data: ${e.message}`);
+      console.error(
+        `[${videoId}] Failed to parse final captions JSON: ${
+          e.message
+        }. Raw Data: ${rawCaptionsData.substring(0, 200)}...`
+      );
+      throw new Error(`Failed to parse final captions data: ${e.message}`);
     }
 
-    // Check if captions are available
-    if (!captionsData.playerCaptionsTracklistRenderer) {
-      throw new Error("Transcript is disabled on this video");
+    if (
+      !captionsData?.playerCaptionsTracklistRenderer?.captionTracks ||
+      captionsData.playerCaptionsTracklistRenderer.captionTracks.length === 0
+    ) {
+      console.warn(
+        `[${videoId}] Parsed captions data lacks track information or is empty.`
+      );
+      throw new Error(
+        "Transcript tracks unavailable or disabled in parsed data"
+      );
     }
 
-    if (!captionsData.playerCaptionsTracklistRenderer.captionTracks) {
-      throw new Error("No transcript tracks available");
+    // Find the first usable transcript URL (prefer 'en' if available, otherwise take first)
+    let transcriptUrl = "";
+    const tracks = captionsData.playerCaptionsTracklistRenderer.captionTracks;
+    const englishTrack = tracks.find(
+      (track: any) => track.languageCode === "en"
+    );
+    transcriptUrl = englishTrack?.baseUrl || tracks[0]?.baseUrl;
+
+    if (!transcriptUrl) {
+      console.error(
+        `[${videoId}] Could not find a valid baseUrl in caption tracks.`
+      );
+      throw new Error("No valid transcript URL found in caption tracks");
     }
+    console.log(
+      `[${videoId}] Using transcript URL: ${transcriptUrl.substring(0, 60)}...`
+    );
 
-    // Get the first available transcript URL (usually English if available)
-    const transcriptUrl =
-      captionsData.playerCaptionsTracklistRenderer.captionTracks[0].baseUrl;
-
-    // Fetch the transcript XML
+    // Fetch the transcript XML/TTML
     const transcriptResponse = await fetch(transcriptUrl, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9", // Important for getting english transcript if auto-selected
+        Accept: "*/*", // Accept any content type
       },
-      // Add timeout to prevent hanging requests
       signal: AbortSignal.timeout(10000), // 10 second timeout
     });
 
     if (!transcriptResponse.ok) {
+      const errorText = await transcriptResponse.text();
+      console.error(
+        `[${videoId}] Failed to fetch transcript content: ${
+          transcriptResponse.status
+        } ${transcriptResponse.statusText}. Response: ${errorText.substring(
+          0,
+          200
+        )}`
+      );
       throw new Error(
         `Failed to fetch transcript data: ${transcriptResponse.status} ${transcriptResponse.statusText}`
       );
     }
 
-    const transcriptXml = await transcriptResponse.text();
+    const transcriptContent = await transcriptResponse.text();
 
-    // Validate that we received proper XML data
-    if (!transcriptXml || !transcriptXml.includes("<transcript>")) {
-      throw new Error("Invalid transcript data received");
+    // Basic validation of transcript content
+    if (!transcriptContent || transcriptContent.length < 50) {
+      console.error(
+        `[${videoId}] Invalid or empty transcript content received.`
+      );
+      throw new Error("Invalid or empty transcript data received");
+    }
+    // More robust check: look for common transcript tags
+    if (
+      !transcriptContent.includes("<text") &&
+      !transcriptContent.includes("<p")
+    ) {
+      console.warn(
+        `[${videoId}] Transcript content might be invalid (missing common tags): ${transcriptContent.substring(
+          0,
+          200
+        )}...`
+      );
+      // Decide whether to throw error or proceed cautiously
+      // throw new Error("Transcript content appears invalid (missing tags)");
     }
 
-    // Parse the XML to extract transcript
-    const regex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
-    let matches = [];
+    // Parse the XML/TTML to extract transcript segments
+    const transcript = [];
+    // Handle standard XML format <text start="..." dur="...">...</text>
+    const xmlRegex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
+    // Handle alternative format (often in TTML) <p begin="..." end="..." ...>...</p>
+    const ttmlRegex = /<p begin="([^"]*)" end="([^"]*)"[^>]*>([^<]*)<\/p>/g;
+
     let match;
-    while ((match = regex.exec(transcriptXml)) !== null) {
-      matches.push(match);
+    // Try XML first
+    while ((match = xmlRegex.exec(transcriptContent)) !== null) {
+      const offset = parseFloat(match[1]);
+      const duration = parseFloat(match[2]);
+      // Basic sanity check for parsed numbers
+      if (!isNaN(offset) && !isNaN(duration)) {
+        transcript.push({
+          text: match[3]
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&#39;/g, "'")
+            .replace(/&quot;/g, '"')
+            .replace(/\\n/g, " ")
+            .trim(),
+          duration: duration,
+          offset: offset,
+        });
+      } else {
+        console.warn(
+          `[${videoId}] Skipping segment due to invalid number format (XML): start='${match[1]}', dur='${match[2]}'`
+        );
+      }
     }
 
-    if (matches.length === 0) {
-      throw new Error("Failed to parse transcript XML");
+    // If XML parsing yielded nothing, try TTML format
+    if (transcript.length === 0) {
+      console.log(
+        `[${videoId}] XML pattern found no segments, trying TTML pattern...`
+      );
+      while ((match = ttmlRegex.exec(transcriptContent)) !== null) {
+        const offset = parseTimestamp(match[1]); // Need helper to parse HH:MM:SS.ms
+        const end = parseTimestamp(match[2]);
+        const duration = end - offset;
+        // Basic sanity check for parsed numbers
+        if (!isNaN(offset) && !isNaN(duration) && duration >= 0) {
+          transcript.push({
+            text: match[3]
+              .replace(/&amp;/g, "&")
+              .replace(/&lt;/g, "<")
+              .replace(/&gt;/g, ">")
+              .replace(/&#39;/g, "'")
+              .replace(/&quot;/g, '"')
+              .replace(/\\n/g, " ")
+              .trim(),
+            duration: duration,
+            offset: offset,
+          });
+        } else {
+          console.warn(
+            `[${videoId}] Skipping segment due to invalid number format (TTML): begin='${match[1]}', end='${match[2]}'`
+          );
+        }
+      }
     }
 
-    // Convert to transcript format
-    const transcript = matches.map((match) => ({
-      text: match[3]
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&#39;/g, "'")
-        .replace(/&quot;/g, '"'),
-      duration: parseFloat(match[2]),
-      offset: parseFloat(match[1]),
-    }));
+    if (transcript.length === 0) {
+      console.error(
+        `[${videoId}] Failed to parse transcript content using both XML and TTML patterns. Content snippet: ${transcriptContent.substring(
+          0,
+          500
+        )}...`
+      );
+      throw new Error("Failed to parse transcript XML/TTML content");
+    }
 
     console.log(
-      `[${videoId}] Successfully fetched transcript directly: ${transcript.length} segments`
+      `[${videoId}] Successfully fetched and parsed transcript directly: ${transcript.length} segments`
     );
     return transcript;
-  } catch (error) {
-    console.error(`[${videoId}] Direct transcript fetch failed:`, error);
+  } catch (error: any) {
+    // Enhanced logging
+    console.error(
+      `[${videoId}] Direct transcript fetch failed: ${error.message || error}`
+    );
+    // Add more specific logging based on error message content
+    if (error.message?.includes("fetch video page")) {
+      console.error(
+        `[${videoId}] Specific failure: Fetching main video page. Status: ${
+          error.message.split(": ")[1]
+        }`
+      );
+    } else if (error.message?.includes("No captions data found")) {
+      console.error(
+        `[${videoId}] Specific failure: Could not find captions JSON/patterns in HTML.`
+      );
+    } else if (error.message?.includes("parse final captions data")) {
+      console.error(
+        `[${videoId}] Specific failure: Parsing extracted captions JSON.`
+      );
+    } else if (error.message?.includes("fetch transcript data")) {
+      console.error(
+        `[${videoId}] Specific failure: Fetching the transcript content file. Status: ${
+          error.message.split(": ")[1]
+        }`
+      );
+    } else if (error.message?.includes("parse transcript XML/TTML")) {
+      console.error(
+        `[${videoId}] Specific failure: Parsing the final transcript content.`
+      );
+    } else if (error.name === "AbortError") {
+      console.error(
+        `[${videoId}] Direct transcript fetch sub-request timed out.`
+      );
+    } else if (error.message?.includes("Invalid content type")) {
+      console.error(
+        `[${videoId}] Specific failure: Received unexpected content type from YouTube.`
+      );
+    } else if (error.message?.includes("Empty or too short response")) {
+      console.error(
+        `[${videoId}] Specific failure: Received unusable short response from YouTube.`
+      );
+    }
+    // Re-throw the original error to be caught by the main handler's loop
     throw error;
   }
 }
 
-// Helper function to fetch podcast metadata
-const fetchPodcastMetadata = async (videoId: string) => {
-  try {
-    // We need to use a fully qualified URL in server components
-    // Since we need to make an internal API call, construct the URL based on the request URL
-    // This is a self-request to our own API endpoint
-    const origin = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : process.env.NODE_ENV === "development"
-      ? "http://localhost:3000"
-      : "";
-
-    console.log("Using API origin:", origin);
-
-    try {
-      const response = await fetch(`${origin}/api/podcast-metadata`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          url: `https://www.youtube.com/watch?v=${videoId}`,
-        }),
-        // Add timeout to prevent hanging requests
-        signal: AbortSignal.timeout(15000), // 15 second timeout
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to fetch metadata: ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      return data.metadata;
-    } catch (fetchError) {
-      console.error("Error making metadata request:", fetchError);
-
-      // If the internal API call fails, try fetching directly from YouTube's oEmbed API
-      // as a backup that doesn't require the YouTube API key
-      console.log(
-        `[${videoId}] Attempting direct oEmbed fallback for metadata...`
-      );
-
-      const oEmbedResponse = await fetch(
-        `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-        {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-          },
-          signal: AbortSignal.timeout(10000), // 10 second timeout
-        }
-      );
-
-      if (!oEmbedResponse.ok) {
-        throw new Error(`oEmbed fallback failed: ${oEmbedResponse.statusText}`);
-      }
-
-      const oEmbedData = await oEmbedResponse.json();
-
-      // Create a simplified metadata object from oEmbed data
-      return {
-        title: oEmbedData.title || "YouTube Video",
-        channelName: oEmbedData.author_name || "Unknown Channel",
-        duration: "Unknown duration",
-        videoId: videoId,
-        description: "Fetched with fallback method",
-      };
-    }
-  } catch (error) {
-    console.error("Error fetching podcast metadata:", error);
-
-    // Return minimal metadata using just the video ID since that's all we really need
-    return {
-      title: "YouTube Video",
-      channelName: "Unknown Channel",
-      duration: "Unknown duration",
-      videoId: videoId,
-      description: "Could not fetch metadata",
-    };
+// Helper to parse HH:MM:SS.ms timestamps from TTML
+function parseTimestamp(timestamp: string): number {
+  const parts = timestamp.split(":");
+  let seconds = 0;
+  if (parts.length === 3) {
+    seconds += parseFloat(parts[0]) * 3600;
+    seconds += parseFloat(parts[1]) * 60;
+    seconds += parseFloat(parts[2]);
+  } else if (parts.length === 2) {
+    seconds += parseFloat(parts[0]) * 60;
+    seconds += parseFloat(parts[1]);
+  } else if (parts.length === 1) {
+    seconds += parseFloat(parts[0]);
   }
+  return isNaN(seconds) ? 0 : seconds; // Return 0 if parsing fails
+}
+
+// Helper function to fetch podcast metadata (Refactored for Summarize route)
+const fetchPodcastMetadataForSummarize = async (
+  videoId: string
+): Promise<Partial<PodcastMetadata> | null> => {
+  let metadata: Partial<PodcastMetadata> | null = null;
+
+  // 1. Try fetching using the YouTube Data API (shared function)
+  try {
+    console.log(
+      `[${videoId}] (Summarize) Attempting metadata fetch via YouTube API...`
+    );
+    metadata = await fetchMetadataFromYouTubeAPI(videoId);
+    if (metadata) {
+      console.log(
+        `[${videoId}] (Summarize) Metadata successfully fetched via YouTube API.`
+      );
+      return metadata;
+    } else {
+      console.warn(
+        `[${videoId}] (Summarize) YouTube API metadata fetch returned null, proceeding to fallback.`
+      );
+    }
+  } catch (apiError: any) {
+    console.error(
+      `[${videoId}] (Summarize) Error during YouTube API metadata fetch: ${
+        apiError.message || apiError
+      }. Proceeding to fallback.`
+    );
+    if (apiError.name === "AbortError") {
+      console.error(`[${videoId}] (Summarize) YouTube API request timed out.`);
+    }
+  }
+
+  // 2. If API fails or returns null, try oEmbed fallback specific to this route
+  if (!metadata) {
+    try {
+      console.log(
+        `[${videoId}] (Summarize) Attempting metadata fetch via oEmbed fallback...`
+      );
+      metadata = await fetchOEmbedMetadataForSummarize(videoId); // Use the function defined in this file
+      if (metadata) {
+        console.log(
+          `[${videoId}] (Summarize) Metadata successfully fetched via oEmbed.`
+        );
+        return metadata;
+      } else {
+        console.warn(
+          `[${videoId}] (Summarize) oEmbed metadata fetch also returned null.`
+        );
+      }
+    } catch (oembedError: any) {
+      console.error(
+        `[${videoId}] (Summarize) Error during oEmbed metadata fetch: ${
+          oembedError.message || oembedError
+        }`
+      );
+    }
+  }
+
+  // 3. If both methods fail, return null
+  if (!metadata) {
+    console.error(
+      `[${videoId}] (Summarize) All methods failed to fetch metadata.`
+    );
+    return null;
+  }
+
+  return metadata;
 };
 
-// Add a new function for fetching transcripts via the official YouTube API
+// Function to fetch transcript using YouTube API (Enhanced Logging)
+// Note: This often requires OAuth for non-public captions. API key might only work for public ones.
 async function fetchYouTubeTranscriptViaAPI(videoId: string) {
-  try {
-    console.log(
-      `[${videoId}] Attempting to fetch transcript via YouTube API...`
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) {
+    console.warn(
+      `[${videoId}] YouTube API key missing, cannot attempt transcript via API.`
     );
-
-    const apiKey = process.env.YOUTUBE_API_KEY;
-
-    if (!apiKey) {
-      throw new Error("YouTube API key is not configured");
-    }
-
-    // First, we need to get the caption track IDs
-    const captionListUrl = `https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId=${videoId}&key=${apiKey}`;
-
-    const captionListResponse = await fetch(captionListUrl, {
-      headers: {
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(15000), // 15 second timeout
+    return null;
+  }
+  console.log(`[${videoId}] Attempting transcript fetch via YouTube API...`);
+  try {
+    // Fetch caption list
+    const listUrl = `https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId=${videoId}&key=${apiKey}`;
+    const listResponse = await fetch(listUrl, {
+      signal: AbortSignal.timeout(10000),
     });
 
-    if (!captionListResponse.ok) {
-      throw new Error(
-        `Failed to fetch caption list: ${captionListResponse.status} ${captionListResponse.statusText}`
+    if (!listResponse.ok) {
+      const errorText = await listResponse.text();
+      console.error(
+        `[${videoId}] YouTube API caption list request failed: Status ${
+          listResponse.status
+        }. Response: ${errorText.substring(0, 200)}`
       );
-    }
-
-    const captionList = await captionListResponse.json();
-
-    if (!captionList.items || captionList.items.length === 0) {
-      throw new Error("No caption tracks found");
-    }
-
-    // Find the English track preferably, or use the first one
-    let captionTrack = captionList.items[0];
-    for (const track of captionList.items) {
-      if (track.snippet.language === "en") {
-        captionTrack = track;
-        break;
+      if (listResponse.status === 403) {
+        // Forbidden often means captions disabled by owner or requires OAuth
+        console.warn(
+          `[${videoId}] API Error 403: Captions likely disabled or require owner permission (OAuth).`
+        );
+        throw new Error(`Captions disabled or private (API 403)`);
+      } else if (listResponse.status === 404) {
+        console.warn(`[${videoId}] API Error 404: Video/Captions not found.`);
+        throw new Error(`Video or captions not found (API 404)`);
+      } else {
+        throw new Error(
+          `Failed to list captions via API: ${listResponse.statusText}`
+        );
       }
     }
 
-    // Now get the actual transcript using the YouTube transcript URL format
-    const transcriptUrl = `https://www.youtube.com/api/timedtext?lang=${captionTrack.snippet.language}&v=${videoId}&fmt=srv3`;
-
-    const transcriptResponse = await fetch(transcriptUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-      },
-      signal: AbortSignal.timeout(10000), // 10 second timeout
-    });
-
-    if (!transcriptResponse.ok) {
-      throw new Error(
-        `Failed to fetch transcript data: ${transcriptResponse.status} ${transcriptResponse.statusText}`
-      );
+    const listData = await listResponse.json();
+    if (!listData.items || listData.items.length === 0) {
+      console.warn(`[${videoId}] YouTube API returned no caption tracks.`);
+      throw new Error("No caption tracks found via API");
     }
 
-    const transcriptXml = await transcriptResponse.text();
-
-    // Parse the XML to extract transcript
-    const regex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
-    let matches = [];
-    let match;
-    while ((match = regex.exec(transcriptXml)) !== null) {
-      matches.push(match);
-    }
-
-    if (matches.length === 0) {
-      throw new Error("Failed to parse transcript XML");
-    }
-
-    // Convert to transcript format
-    const transcript = matches.map((match) => ({
-      text: match[3]
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&#39;/g, "'")
-        .replace(/&quot;/g, '"'),
-      duration: parseFloat(match[2]),
-      offset: parseFloat(match[1]),
-    }));
+    // Prefer English, fallback to first available
+    const englishTrack = listData.items.find(
+      (item: any) => item.snippet?.language === "en"
+    );
+    const trackToDownload = englishTrack || listData.items[0];
+    const captionId = trackToDownload.id;
 
     console.log(
-      `[${videoId}] Successfully fetched transcript via API: ${transcript.length} segments`
+      `[${videoId}] Found API caption track ID: ${captionId}, Language: ${trackToDownload.snippet?.language}`
     );
-    return transcript;
-  } catch (error) {
-    console.error(`[${videoId}] YouTube API transcript fetch failed:`, error);
-    throw error;
+
+    // Download the caption track (try common formats, srt might work with API key)
+    // Note: download often requires OAuth, but try standard formats. ttml is common.
+    let downloadedTranscript = null;
+    const formatsToTry = ["srt", "vtt", "ttml"]; // Common formats
+    for (const format of formatsToTry) {
+      const downloadUrl = `https://www.googleapis.com/youtube/v3/captions/${captionId}?key=${apiKey}&tfmt=${format}`;
+      try {
+        console.log(`[${videoId}] Attempting API download format: ${format}`);
+        const downloadResponse = await fetch(downloadUrl, {
+          signal: AbortSignal.timeout(10000),
+        });
+        if (downloadResponse.ok) {
+          downloadedTranscript = await downloadResponse.text();
+          console.log(
+            `[${videoId}] Successfully downloaded API transcript format: ${format}`
+          );
+          break; // Success
+        } else {
+          const errorText = await downloadResponse.text();
+          console.warn(
+            `[${videoId}] API download failed for format ${format}: Status ${
+              downloadResponse.status
+            }. Response: ${errorText.substring(0, 200)}`
+          );
+          // Continue to next format
+        }
+      } catch (downloadError: any) {
+        console.warn(
+          `[${videoId}] Error during API download attempt for format ${format}: ${downloadError.message}`
+        );
+        // Continue to next format
+      }
+    }
+
+    if (!downloadedTranscript) {
+      console.error(
+        `[${videoId}] Failed to download API transcript using formats: ${formatsToTry.join(
+          ", "
+        )}`
+      );
+      throw new Error(`Failed to download caption track using any format`);
+    }
+
+    // Simple parsing (assuming SRT or VTT-like format - needs improvement for robustness)
+    // This is a placeholder - a proper SRT/VTT parser is recommended
+    const lines = downloadedTranscript.split("\\n");
+    const transcript = lines
+      .map((line) => line.trim())
+      .filter((line) => line && !line.match(/^\d+$/) && !line.includes("-->")) // Basic filter
+      .map((text) => ({ text, duration: 0, offset: 0 })); // Dummy duration/offset
+
+    if (transcript.length === 0) {
+      console.error(
+        `[${videoId}] Failed to parse downloaded API transcript content.`
+      );
+      throw new Error("Failed to parse downloaded API transcript");
+    }
+
+    console.log(
+      `[${videoId}] Successfully fetched and parsed transcript via YouTube API: ${transcript.length} lines (basic parse).`
+    );
+    return transcript; // Return the parsed transcript
+  } catch (error: any) {
+    console.error(
+      `[${videoId}] YouTube API transcript fetch failed: ${
+        error.message || error
+      }`
+    );
+    if (error.name === "AbortError") {
+      console.error(
+        `[${videoId}] YouTube API transcript fetch sub-request timed out.`
+      );
+    }
+    // Specific logging based on error message
+    if (
+      error.message?.includes("Captions disabled") ||
+      error.message?.includes("API 403")
+    ) {
+      console.warn(
+        `[${videoId}] Transcript fetch via API blocked (likely disabled/private).`
+      );
+    } else if (error.message?.includes("No caption tracks")) {
+      console.warn(`[${videoId}] No caption tracks listed by API.`);
+    } else if (error.message?.includes("Failed to download")) {
+      console.error(
+        `[${videoId}] Critical failure during API transcript download phase.`
+      );
+    }
+    return null; // Indicate failure to the caller to try next method
   }
 }
 
-// Add a new function using a completely different scraping approach
+// Function to fetch transcript using Innertube API (Enhanced Logging)
 async function fetchYouTubeTranscriptViaInnertubeAPI(videoId: string) {
+  console.log(`[${videoId}] Attempting transcript fetch via Innertube API...`);
+  let pageContent = ""; // Store page content for debugging
   try {
-    console.log(
-      `[${videoId}] Attempting to fetch transcript via Innertube API...`
-    );
-
-    // First get the initial page to extract context data
-    const initialResponse = await fetch(
+    // 1. Fetch the video page
+    const pageResponse = await fetch(
       `https://www.youtube.com/watch?v=${videoId}`,
       {
         headers: {
           "User-Agent":
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
           "Accept-Language": "en-US,en;q=0.9",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         },
-        signal: AbortSignal.timeout(15000), // 15 second timeout
+        signal: AbortSignal.timeout(15000),
       }
     );
-
-    if (!initialResponse.ok) {
+    if (!pageResponse.ok) {
       throw new Error(
-        `Failed to fetch video page: ${initialResponse.status} ${initialResponse.statusText}`
+        `Failed to fetch video page: ${pageResponse.status} ${pageResponse.statusText}`
       );
     }
-
-    const html = await initialResponse.text();
-
-    // Extract API key - try multiple patterns
-    let innertubeApiKey = null;
-
-    // Pattern 1
-    const apiKeyMatch = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-    if (apiKeyMatch && apiKeyMatch[1]) {
-      innertubeApiKey = apiKeyMatch[1];
+    pageContent = await pageResponse.text();
+    if (!pageContent || pageContent.length < 1000) {
+      throw new Error("Empty or too short response from YouTube page fetch");
     }
 
-    // Pattern 2 (alternative)
-    if (!innertubeApiKey) {
-      const apiKeyMatch2 = html.match(/innertubeApiKey":"([^"]+)"/);
-      if (apiKeyMatch2 && apiKeyMatch2[1]) {
-        innertubeApiKey = apiKeyMatch2[1];
-      }
-    }
+    // 2. Extract necessary data (API Key, Client Version, Context)
+    const apiKeyMatch = pageContent.match(/"innertubeApiKey":"([^"]+)"/);
+    const clientVersionMatch = pageContent.match(/"clientVersion":"([^"]+)"/);
+    // Context extraction is complex, find ytInitialPlayerResponse or similar
+    const playerResponseMatch = pageContent.match(
+      /ytInitialPlayerResponse\s*=\s*(\{.*?\});/
+    );
 
-    // Pattern 3 (another alternative)
-    if (!innertubeApiKey) {
-      const apiKeyMatch3 = html.match(
-        /INNERTUBE_API_KEY\s*[:=]\s*['"]([^'"]+)['"]/
-      );
-      if (apiKeyMatch3 && apiKeyMatch3[1]) {
-        innertubeApiKey = apiKeyMatch3[1];
-      }
-    }
-
-    if (!innertubeApiKey) {
+    if (!apiKeyMatch || !apiKeyMatch[1])
       throw new Error("Could not extract Innertube API key");
-    }
+    if (!clientVersionMatch || !clientVersionMatch[1])
+      throw new Error("Could not extract client version");
+    if (!playerResponseMatch || !playerResponseMatch[1])
+      throw new Error(
+        "Could not extract player context (ytInitialPlayerResponse)"
+      );
 
-    // Extract client version - try multiple patterns
-    let clientVersion = null;
-
-    // Pattern a
-    const clientVersionMatch = html.match(/"clientVersion":"([^"]+)"/);
-    if (clientVersionMatch && clientVersionMatch[1]) {
-      clientVersion = clientVersionMatch[1];
-    }
-
-    // Pattern b (alternative)
-    if (!clientVersion) {
-      const clientVersionMatch2 = html.match(/clientVersion":"([^"]+)"/);
-      if (clientVersionMatch2 && clientVersionMatch2[1]) {
-        clientVersion = clientVersionMatch2[1];
-      }
-    }
-
-    // If all else fails, use a hardcoded recent version
-    if (!clientVersion) {
-      console.log(`[${videoId}] Using hardcoded client version as fallback`);
-      clientVersion = "2.20240529.01.00";
-    }
-
-    // Try alternative direct method for getting transcripts if we have issues with the API
+    const apiKey = apiKeyMatch[1];
+    const clientVersion = clientVersionMatch[1];
+    let playerResponse;
     try {
-      // Now we'll use the Innertube API to request the transcript
-      const response = await fetch(
-        `https://www.youtube.com/youtubei/v1/get_transcript?key=${innertubeApiKey}`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent":
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-          },
-          body: JSON.stringify({
-            context: {
-              client: {
-                clientName: "WEB",
-                clientVersion: clientVersion,
-                hl: "en",
-                gl: "US",
-              },
-            },
-            params: Buffer.from(JSON.stringify({ videoId })).toString("base64"),
-          }),
-          signal: AbortSignal.timeout(10000), // 10 second timeout
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(
-          `Failed to fetch transcript: ${response.status} ${response.statusText}`
-        );
-      }
-
-      const data = await response.json();
-
-      // Check if there are captions
-      if (
-        !data ||
-        !data.actions ||
-        !data.actions[0] ||
-        !data.actions[0].updateEngagementPanelAction
-      ) {
-        throw new Error("No transcript data in response");
-      }
-
-      const transcriptRenderer =
-        data.actions[0].updateEngagementPanelAction.content.transcriptRenderer;
-
-      if (
-        !transcriptRenderer ||
-        !transcriptRenderer.body ||
-        !transcriptRenderer.body.transcriptBodyRenderer
-      ) {
-        throw new Error("No transcript body found");
-      }
-
-      const cueGroups =
-        transcriptRenderer.body.transcriptBodyRenderer.cueGroups;
-
-      if (!cueGroups || cueGroups.length === 0) {
-        throw new Error("No cue groups found in transcript");
-      }
-
-      // Parse the transcript data
-      const transcript = cueGroups.map((cueGroup) => {
-        const cue =
-          cueGroup.transcriptCueGroupRenderer.cues[0].transcriptCueRenderer;
-        return {
-          text: cue.cue.simpleText,
-          duration: 0, // Transcript from this API might not include durations
-          offset: parseFloat(cue.startOffsetMs) / 1000, // Convert ms to seconds
-        };
-      });
-
-      console.log(
-        `[${videoId}] Successfully fetched transcript via Innertube API: ${transcript.length} segments`
-      );
-      return transcript;
-    } catch (innerApiError) {
+      playerResponse = JSON.parse(playerResponseMatch[1]);
+    } catch (e: any) {
       console.error(
-        `[${videoId}] Innertube API request failed:`,
-        innerApiError
+        `[${videoId}] Failed to parse ytInitialPlayerResponse JSON: ${e.message}`
       );
-
-      // We might still be able to extract the transcript directly from the page
-      console.log(
-        `[${videoId}] Attempting to extract transcript directly from page...`
-      );
-
-      // Find the transcript data in the initial page response
-      const transcriptData = html.match(/"captionTracks":\[(.*?)\]/);
-      if (!transcriptData || !transcriptData[1]) {
-        throw new Error("No transcript data found in page");
-      }
-
-      // Find the first caption track URL
-      const baseUrlMatch = transcriptData[1].match(/"baseUrl":"([^"]+)"/);
-      if (!baseUrlMatch || !baseUrlMatch[1]) {
-        throw new Error("No baseUrl found in transcript data");
-      }
-
-      // Clean up the URL (unescape)
-      const transcriptUrl = baseUrlMatch[1]
-        .replace(/\\u0026/g, "&")
-        .replace(/\\\//g, "/");
-
-      // Fetch the transcript XML
-      const transcriptResponse = await fetch(transcriptUrl, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        },
-        signal: AbortSignal.timeout(10000), // 10 second timeout
-      });
-
-      if (!transcriptResponse.ok) {
-        throw new Error(
-          `Failed to fetch transcript data: ${transcriptResponse.status} ${transcriptResponse.statusText}`
-        );
-      }
-
-      const transcriptXml = await transcriptResponse.text();
-
-      // Parse the XML to extract transcript
-      const regex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
-      let matches = [];
-      let match;
-      while ((match = regex.exec(transcriptXml)) !== null) {
-        matches.push(match);
-      }
-
-      if (matches.length === 0) {
-        throw new Error("Failed to parse transcript XML");
-      }
-
-      // Convert to transcript format
-      const transcript = matches.map((match) => ({
-        text: match[3]
-          .replace(/&amp;/g, "&")
-          .replace(/&lt;/g, "<")
-          .replace(/&gt;/g, ">")
-          .replace(/&#39;/g, "'")
-          .replace(/&quot;/g, '"'),
-        duration: parseFloat(match[2]),
-        offset: parseFloat(match[1]),
-      }));
-
-      console.log(
-        `[${videoId}] Successfully extracted transcript from page: ${transcript.length} segments`
-      );
-      return transcript;
+      throw new Error("Failed to parse player context JSON");
     }
-  } catch (error) {
-    console.error(`[${videoId}] Innertube API transcript fetch failed:`, error);
-    throw error;
+
+    // Find captions URL within the player response
+    const captionTracks =
+      playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (!captionTracks || captionTracks.length === 0) {
+      throw new Error("No caption tracks found in Innertube player response");
+    }
+
+    // Prefer English track, fallback to the first one
+    const englishTrack = captionTracks.find(
+      (track: any) => track.languageCode === "en"
+    );
+    const targetTrack = englishTrack || captionTracks[0];
+    const captionsUrl = targetTrack?.baseUrl;
+
+    if (!captionsUrl) {
+      throw new Error(
+        "Could not find captions baseUrl in Innertube player response"
+      );
+    }
+
+    console.log(
+      `[${videoId}] Found Innertube captions URL for lang ${
+        targetTrack.languageCode
+      }: ${captionsUrl.substring(0, 60)}...`
+    );
+
+    // 3. Fetch the actual transcript from the Innertube captions URL
+    const transcriptResponse = await fetch(captionsUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!transcriptResponse.ok) {
+      const errorText = await transcriptResponse.text();
+      console.error(
+        `[${videoId}] Innertube captions URL fetch failed: Status ${
+          transcriptResponse.status
+        }. Response: ${errorText.substring(0, 200)}`
+      );
+      throw new Error(
+        `Innertube captions URL fetch failed: ${transcriptResponse.statusText}`
+      );
+    }
+
+    const transcriptContent = await transcriptResponse.text();
+    if (!transcriptContent || transcriptContent.length < 50) {
+      throw new Error("Empty or invalid transcript content from Innertube URL");
+    }
+
+    // 4. Parse the transcript (reuse direct fetch parsing logic)
+    const transcript = [];
+    const xmlRegex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
+    const ttmlRegex = /<p begin="([^"]*)" end="([^"]*)"[^>]*>([^<]*)<\/p>/g;
+    let match;
+
+    while ((match = xmlRegex.exec(transcriptContent)) !== null) {
+      const offset = parseFloat(match[1]);
+      const duration = parseFloat(match[2]);
+      if (!isNaN(offset) && !isNaN(duration)) {
+        transcript.push({
+          text: match[3]
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&#39;/g, "'")
+            .replace(/&quot;/g, '"')
+            .replace(/\\n/g, " ")
+            .trim(),
+          duration: duration,
+          offset: offset,
+        });
+      }
+    }
+
+    if (transcript.length === 0) {
+      console.log(
+        `[${videoId}] Innertube XML pattern found no segments, trying TTML pattern...`
+      );
+      while ((match = ttmlRegex.exec(transcriptContent)) !== null) {
+        const offset = parseTimestamp(match[1]);
+        const end = parseTimestamp(match[2]);
+        const duration = end - offset;
+        if (!isNaN(offset) && !isNaN(duration) && duration >= 0) {
+          transcript.push({
+            text: match[3]
+              .replace(/&amp;/g, "&")
+              .replace(/&lt;/g, "<")
+              .replace(/&gt;/g, ">")
+              .replace(/&#39;/g, "'")
+              .replace(/&quot;/g, '"')
+              .replace(/\\n/g, " ")
+              .trim(),
+            duration: duration,
+            offset: offset,
+          });
+        }
+      }
+    }
+
+    if (transcript.length === 0) {
+      console.error(
+        `[${videoId}] Failed to parse Innertube transcript content using both XML and TTML patterns. Content snippet: ${transcriptContent.substring(
+          0,
+          500
+        )}...`
+      );
+      throw new Error("Failed to parse Innertube transcript content");
+    }
+
+    console.log(
+      `[${videoId}] Successfully fetched and parsed transcript via Innertube API: ${transcript.length} segments`
+    );
+    return transcript;
+  } catch (error: any) {
+    console.error(
+      `[${videoId}] Innertube API transcript fetch failed: ${
+        error.message || error
+      }`
+    );
+    // Add specific logging based on error messages
+    if (error.message?.includes("fetch video page")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Fetching initial page. Status: ${
+          error.message.split(": ")[1]
+        }`
+      );
+    } else if (error.message?.includes("extract Innertube API key")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Extracting API key. Check page structure.`
+      );
+      // console.log(`[${videoId}] Innertube Page Snippet: ${pageContent?.substring(0, 500)}`); // Debugging
+    } else if (error.message?.includes("extract client version")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Extracting client version. Check page structure.`
+      );
+    } else if (error.message?.includes("extract player context")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Extracting ytInitialPlayerResponse. Check page structure.`
+      );
+    } else if (error.message?.includes("parse player context")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Parsing ytInitialPlayerResponse JSON.`
+      );
+    } else if (error.message?.includes("No caption tracks found")) {
+      console.warn(
+        `[${videoId}] Innertube Info: No caption tracks listed in player response.`
+      );
+    } else if (error.message?.includes("Could not find captions baseUrl")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Found tracks but no baseUrl.`
+      );
+    } else if (error.message?.includes("Innertube captions URL fetch failed")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Fetching final transcript content. Status: ${
+          error.message.split(": ")[1]
+        }`
+      );
+    } else if (
+      error.message?.includes("Failed to parse Innertube transcript content")
+    ) {
+      console.error(
+        `[${videoId}] Innertube Failure: Parsing final transcript content.`
+      );
+    } else if (error.name === "AbortError") {
+      console.error(
+        `[${videoId}] Innertube API transcript fetch sub-request timed out.`
+      );
+    } else if (error.message?.includes("Empty or too short response")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Empty/short response fetching initial page.`
+      );
+    } else if (error.message?.includes("Empty or invalid transcript content")) {
+      console.error(
+        `[${videoId}] Innertube Failure: Empty/short response fetching final transcript.`
+      );
+    }
+    return null; // Indicate failure to the caller to try next method
   }
 }
 
+// Main POST handler (modified to handle metadata failure and try multiple transcript methods)
 export async function POST(request: Request) {
+  let videoId = ""; // Initialize videoId for broader scope logging
   try {
-    // Parse request body
-    const body = await request.json();
-    const { url } = body;
+    const { url } = await request.json();
 
-    console.log("Processing URL:", url);
-
-    if (!url) {
-      console.error("No URL provided");
-      return NextResponse.json({ error: "No URL provided" }, { status: 400 });
-    }
-
-    // Extract video ID from URL
-    const videoId = url.match(
+    // Extract video ID
+    const videoIdMatch = url.match(
       /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/))([^&?\s]+)/
-    )?.[1];
+    );
 
-    if (!videoId) {
-      console.error("Invalid YouTube URL:", url);
+    if (!videoIdMatch) {
+      console.error("Invalid YouTube URL received:", url);
       return NextResponse.json(
-        { error: "Invalid YouTube URL" },
+        { error: "Invalid YouTube URL format." },
         { status: 400 }
       );
     }
+    videoId = videoIdMatch[1];
 
-    console.log("Extracted video ID:", videoId);
+    // --- Fetch Metadata ---
+    console.log(`[${videoId}] Starting process: Fetching metadata...`);
+    // Use Partial<PodcastMetadata> as the functions return partial data
+    const metadata: Partial<PodcastMetadata> | null =
+      await fetchPodcastMetadataForSummarize(videoId);
 
-    // Fetch podcast metadata
-    const metadata = await fetchPodcastMetadata(videoId);
-    console.log("Fetched metadata:", metadata);
+    if (!metadata) {
+      console.error(
+        `[${videoId}] Critical failure: Could not fetch required metadata after all attempts.`
+      );
+      return NextResponse.json(
+        {
+          error:
+            "Failed to fetch essential video metadata. The video might be private, deleted, or there could be an issue with the YouTube API/oEmbed services.",
+        },
+        { status: 500 } // Internal Server Error might be more appropriate than 404
+      );
+    }
+    // Log only essential metadata fields fetched
+    console.log(
+      `[${videoId}] Metadata fetched (Title: ${metadata.title}, Channel: ${metadata.channelName}). Proceeding...`
+    );
 
-    // Get transcript
-    try {
-      console.log(`[${videoId}] Attempting to fetch transcript...`);
+    // --- Transcript Fetching Logic with Fallbacks ---
+    let transcript: any = null; // Use 'any' or a specific transcript segment type
+    let lastTranscriptError: Error | null = null;
+    const transcriptMethods = [
+      {
+        name: "Library",
+        func: () =>
+          YoutubeTranscript.fetchTranscript(videoId, {
+            lang: "en",
+          } as TranscriptConfig),
+      }, // Specify lang if possible
+      { name: "Direct", func: () => fetchYouTubeTranscriptDirectly(videoId) },
+      // { name: 'API', func: () => fetchYouTubeTranscriptViaAPI(videoId) }, // Often requires OAuth, less reliable with key alone. Uncomment if OAuth is implemented or key works.
+      {
+        name: "Innertube",
+        func: () => fetchYouTubeTranscriptViaInnertubeAPI(videoId),
+      },
+    ];
 
-      let transcript;
-
-      // First try with the standard library
+    console.log(`[${videoId}] Starting transcript fetching sequence...`);
+    for (const method of transcriptMethods) {
       try {
-        transcript = await YoutubeTranscript.fetchTranscript(videoId);
-        console.log(
-          `[${videoId}] Standard library successfully fetched transcript: ${transcript?.length} segments`
-        );
-      } catch (standardError) {
-        console.error(
-          `[${videoId}] Standard library transcript fetch failed:`,
-          standardError
-        );
-        console.log(
-          `[${videoId}] Attempting fallback transcript fetch method...`
-        );
-
-        // Try with our custom direct fetch method
-        try {
-          transcript = await fetchYouTubeTranscriptDirectly(videoId);
-        } catch (directError) {
-          console.error(
-            `[${videoId}] Direct transcript fetch failed:`,
-            directError
+        console.log(`[${videoId}] Trying transcript method: ${method.name}...`);
+        // Ensure the function call is awaited
+        transcript = await method.func();
+        // Check if transcript is valid (not null and has content)
+        if (transcript && Array.isArray(transcript) && transcript.length > 0) {
+          console.log(
+            `[${videoId}] Transcript successfully fetched using method: ${method.name} (${transcript.length} segments).`
           );
-
-          // Try with our YouTube API method
-          try {
-            transcript = await fetchYouTubeTranscriptViaAPI(videoId);
-          } catch (apiError) {
-            console.error(
-              `[${videoId}] YouTube API transcript fetch failed:`,
-              apiError
-            );
-
-            // Try with our Innertube API method as last resort
-            transcript = await fetchYouTubeTranscriptViaInnertubeAPI(videoId);
+          break; // Exit loop on success
+        } else if (
+          transcript &&
+          Array.isArray(transcript) &&
+          transcript.length === 0
+        ) {
+          // Handle cases where the function returns empty array without throwing an error
+          console.warn(
+            `[${videoId}] Transcript method ${method.name} completed but returned an empty array.`
+          );
+          lastTranscriptError = new Error(
+            `Method ${method.name} returned empty transcript array.`
+          );
+        } else if (!transcript) {
+          console.warn(
+            `[${videoId}] Transcript method ${method.name} completed but returned null/undefined.`
+          );
+          lastTranscriptError = new Error(
+            `Method ${method.name} returned null/undefined.`
+          );
+        }
+      } catch (error: any) {
+        console.warn(`[${videoId}] Transcript method ${method.name} failed.`); // Detailed log happens inside function
+        lastTranscriptError = error; // Store the last error encountered
+        // Specific handling for common library errors
+        if (method.name === "Library") {
+          if (error.message?.includes("[YoutubeTranscript]")) {
+            // Check for specific known library errors like "disabled" or "no captions"
+            if (
+              error.message.toLowerCase().includes("disabled") ||
+              error.message.toLowerCase().includes("no captions")
+            ) {
+              console.log(
+                `[${videoId}] Library indicates transcript unavailable/disabled.`
+              );
+            }
           }
         }
-      }
-
-      console.log(
-        `[${videoId}] Raw transcript response received. Length: ${transcript?.length}`
-      );
-
-      if (!transcript || transcript.length === 0) {
-        console.error(`[${videoId}] No transcript data found in the response.`);
-        return NextResponse.json(
-          { error: "No transcript found for this video" },
-          { status: 404 }
-        );
-      }
-
-      const transcriptText = transcript.map((item) => item.text).join(" ");
-      console.log(
-        `[${videoId}] Transcript processed. Text length: ${transcriptText.length}`
-      );
-
-      if (!transcriptText || transcriptText.trim() === "") {
-        console.error(`[${videoId}] Processed transcript text is empty.`);
-        return NextResponse.json(
-          { error: "Empty transcript found for this video" },
-          { status: 404 }
-        );
-      }
-
-      // Truncate transcript if it's too long (OpenAI has token limits)
-      const maxChars = 42000; // Approximately 12000 tokens
-      const truncatedText =
-        transcriptText.length > maxChars
-          ? transcriptText.slice(0, maxChars) + "..."
-          : transcriptText;
-
-      console.log(
-        `[${videoId}] Truncated transcript text length: ${truncatedText.length}`
-      );
-
-      // Generate summary using OpenAI
-      try {
-        console.log("Calling OpenAI API...");
-
-        // Prepare metadata information for the prompt
-        const metadataInfo = metadata
-          ? `Video Title: ${metadata.title}\nChannel: ${metadata.channelName}\nDuration: ${metadata.duration}\n\n`
-          : "";
-
-        const completion = await openai.chat.completions.create({
-          messages: [
-            {
-              role: "system",
-              content: `You're a chill podcast buddy who loves breaking down episodes in a friendly, conversational way. Talk like you're texting a friend about a cool podcast you just heard. Keep it casual but insightful!
-
-Output Format (in Markdown):
-1. ## Executive Summary
-   Give a quick overview of what the podcast was about - the main vibes and key points. Make it 2 paragraphs. Keep it conversational and engaging.
-
-2. ## Key Insights
-   Identify and explain the most important ideas, revelations, or arguments presented in the podcast. Generate 5-7 points. For each one:
-   - Explain it in a casual, friendly way yet insightful
-   - Why it's worth thinking about
-   - Add a timestamp if you can find one
-
-3. ## Detailed Timeline
-   Create a chronological breakdown of the podcast with timestamps at meaningful transition points:
-   - [00:00:00] - [00:XX:XX]: Brief description of opening segment
-   - [00:XX:XX] - [00:XX:XX]: Brief description of next topic/segment
-  (Continue throughout the entire podcast)
-
-4. ## Notable Quotes
-   The best lines that stood out. Generate 3-5 points. For each one:
-   - "Direct quote" - Who said it (timestamp if you have it)
-
-5. ## Related Stuff
-   Any books, articles, people, or other cool things they mentioned that listeners might want to check out.
-
-6. ## Questions to Think About
-   Some interesting questions that came up that might make you think. Generate 5-7 points.
-
-Guidelines:
-- Skip the boring parts and focus on the good stuff
-- Point out when topics change
-- Keep your personal opinions out of it
-- Highlight the surprising or unique perspectives
-- Note when people agree or disagree
-- Think about what this all means in the bigger picture`,
-            },
-            {
-              role: "user",
-              content: `Please analyze the following podcast transcript and provide a summary according to the specified format:
-
-${metadataInfo}${truncatedText}`,
-            },
-          ],
-          model: "gpt-4o-mini",
-          max_tokens: 2048,
-          temperature: 0.7,
-        });
-
-        console.log("OpenAI API response received");
-        const summary = completion.choices[0].message.content;
-
-        if (!summary) {
-          console.error("No summary generated by OpenAI");
-          throw new Error("No summary generated by OpenAI");
+        // If direct or innertube fail with "disabled" or "no captions found", log it
+        if (
+          (method.name === "Direct" || method.name === "Innertube") &&
+          (error.message?.toLowerCase().includes("disabled") ||
+            error.message?.toLowerCase().includes("no captions data found") ||
+            error.message?.toLowerCase().includes("no caption tracks found"))
+        ) {
+          console.log(
+            `[${videoId}] ${method.name} method indicates transcript unavailable/disabled.`
+          );
         }
-
-        // Format the summary to ensure proper Markdown
-        const formattedSummary = summary
-          // Ensure proper line breaks for headers
-          .replace(/^(#+)\s+/gm, "\n$1 ")
-          // Ensure proper line breaks for lists
-          .replace(/^(\s*[-*])/gm, "\n$1")
-          // Ensure proper line breaks for numbered lists
-          .replace(/^(\s*\d+\.)/gm, "\n$1")
-          // Remove any extra line breaks
-          .replace(/\n{3,}/g, "\n\n")
-          // Trim whitespace
-          .trim();
-
-        console.log("Summary length:", formattedSummary.length, "characters");
-
-        // Return both the summary and metadata if available
-        if (metadata) {
-          return NextResponse.json({
-            summary: formattedSummary,
-            metadata: metadata,
-          });
-        }
-
-        return NextResponse.json({ summary: formattedSummary });
-      } catch (openaiError: any) {
-        console.error("OpenAI API Error:", {
-          message: openaiError.message,
-          type: openaiError.type,
-          stack: openaiError.stack,
-          response: openaiError.response?.data,
-        });
-        return NextResponse.json(
-          {
-            error: `Failed to generate summary using AI: ${openaiError.message}`,
-          },
-          { status: 500 }
-        );
-      }
-    } catch (transcriptError: any) {
-      console.error(`[${videoId}] Transcript Fetching Error:`, {
-        message: transcriptError.message,
-        name: transcriptError.name,
-        // Consider logging more properties if available, e.g., error code
-        stack: transcriptError.stack,
-      });
-
-      // Provide more user-friendly error messages based on the error
-      let userErrorMessage = `Failed to fetch video transcript: ${transcriptError.message}`;
-      let statusCode = 404;
-
-      if (
-        transcriptError.message.includes("No captions data found") ||
-        transcriptError.message.includes("Transcript is disabled") ||
-        transcriptError.message.includes("No transcript tracks available") ||
-        transcriptError.message.includes("No caption tracks found") ||
-        transcriptError.message.includes("No cue groups found")
-      ) {
-        userErrorMessage =
-          "This video doesn't have captions or transcripts available. Please try a different YouTube video that has captions enabled.";
-      } else if (
-        transcriptError.message.includes("Failed to fetch video page")
-      ) {
-        userErrorMessage =
-          "Unable to access this YouTube video. The video might be private, restricted, or no longer available.";
-      } else if (
-        transcriptError.message.includes("Unauthorized") ||
-        transcriptError.message.includes("API key")
-      ) {
-        statusCode = 500;
-        userErrorMessage =
-          "There was an authorization issue accessing YouTube's data. This is a server configuration problem.";
-      }
-
-      // Check if we should try to get some basic metadata anyway, even though transcript failed
-      try {
-        const basicMetadata = await fetchPodcastMetadata(videoId);
-
-        return NextResponse.json(
-          {
-            error: userErrorMessage,
-            metadata: basicMetadata, // Include metadata even when transcript fails
-            videoId,
-          },
-          { status: statusCode }
-        );
-      } catch (metadataError) {
-        // If even metadata fails, just return the error
-        return NextResponse.json(
-          { error: userErrorMessage, videoId },
-          { status: statusCode }
-        );
       }
     }
-  } catch (error: any) {
-    console.error("General Error:", {
-      message: error.message,
-      stack: error.stack,
+
+    // --- Process Transcript (if fetched) ---
+    let summary = "Could not generate summary."; // Default summary
+    let processedTranscriptText = "Transcript not available.";
+
+    if (transcript && Array.isArray(transcript) && transcript.length > 0) {
+      console.log(
+        `[${videoId}] Transcript obtained (${transcript.length} segments), proceeding to format and summarize...`
+      );
+      // Join transcript segments into a single string
+      processedTranscriptText = transcript
+        .map((item: { text: string }) => item.text)
+        .join(" ");
+
+      // Basic check for meaningful transcript content
+      if (processedTranscriptText.trim().length < 50) {
+        // Arbitrary short length check
+        console.warn(
+          `[${videoId}] Transcript text seems very short (${
+            processedTranscriptText.trim().length
+          } chars), summary might be poor.`
+        );
+        summary =
+          "Summary could not be generated (transcript content was too short or invalid).";
+        processedTranscriptText =
+          "Transcript content appears invalid or too short.";
+        // Decide if we should still return 200 or an error state
+        return NextResponse.json(
+          {
+            metadata: metadata as PodcastMetadata, // Return metadata
+            summary: summary,
+            transcript: processedTranscriptText,
+            error: "Transcript content invalid/short.",
+          },
+          { status: 200 }
+        ); // Return 200 OK but indicate transcript issue in payload
+      } else {
+        // --- Summarization Logic ---
+        try {
+          const MAX_TRANSCRIPT_LENGTH = 100000; // gpt-4o-mini has large context, but keep reasonable limit
+          let transcriptForPrompt = processedTranscriptText;
+          if (processedTranscriptText.length > MAX_TRANSCRIPT_LENGTH) {
+            console.warn(
+              `[${videoId}] Transcript length (${processedTranscriptText.length}) exceeds limit (${MAX_TRANSCRIPT_LENGTH}), truncating.`
+            );
+            transcriptForPrompt = processedTranscriptText.substring(
+              0,
+              MAX_TRANSCRIPT_LENGTH
+            );
+          }
+
+          // Construct a more detailed prompt
+          const prompt = `
+                  **Analyze the following podcast transcript:**
+
+                  **Metadata:**
+                  - Title: ${metadata.title || "N/A"}
+                  - Channel: ${metadata.channelName || "N/A"}
+                  ${metadata.duration ? `- Duration: ${metadata.duration}` : ""}
+
+                  **Transcript:**
+                  """
+                  ${transcriptForPrompt}
+                  """
+
+                  **Instructions:**
+                  Generate a comprehensive yet concise summary in Markdown format. Structure the summary with the following sections, ensuring each section has meaningful content derived *only* from the provided transcript and metadata. If a section cannot be populated from the text, omit it or state "Not applicable based on transcript."
+
+                  1.  **Executive Summary:** (1-2 paragraphs capturing the core essence and main topics discussed).
+                  2.  **Key Insights:** (3-5 distinct bullet points highlighting the most important takeaways, arguments, or findings).
+                  3.  **Notable Quotes:** (2-3 impactful or representative quotes directly from the transcript, correctly attributed if possible, otherwise just list the quote).
+                  4.  **Potential Action Items / Further Questions:** (1-3 actionable suggestions or thought-provoking questions raised by the content).
+
+                  **Formatting Requirements:**
+                  - Use standard Markdown (headers, bolding, lists).
+                  - Ensure clarity, accuracy, and conciseness.
+                  - Do NOT add any introductory or concluding phrases outside of the requested sections.
+                  - Output only the Markdown content.
+               `;
+
+          console.log(
+            `[${videoId}] Sending request to OpenAI (gpt-4o-mini) for summarization...`
+          );
+          const response = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: 1200, // Increased slightly for potentially longer summaries
+            temperature: 0.5,
+            // stop: ["\n\n"], // Optional: control stop sequences if needed
+          });
+          console.log(`[${videoId}] OpenAI summarization response received.`);
+
+          if (
+            !response.choices ||
+            response.choices.length === 0 ||
+            !response.choices[0].message?.content
+          ) {
+            // Log the API response if available and failed
+            console.error(
+              `[${videoId}] Invalid or empty response received from OpenAI. Response:`,
+              JSON.stringify(response, null, 2)
+            );
+            throw new Error("Invalid or empty response received from OpenAI.");
+          }
+
+          summary = response.choices[0].message.content.trim();
+        } catch (openaiError: any) {
+          console.error(
+            `[${videoId}] Error during OpenAI summarization: ${
+              openaiError.message || openaiError
+            }`
+          );
+          // Check for specific OpenAI errors (e.g., rate limits, content policy)
+          if (openaiError.response) {
+            // Check if it's an API error response
+            console.error(
+              `[${videoId}] OpenAI API Error Details: Status ${
+                openaiError.response.status
+              }, Data: ${JSON.stringify(openaiError.response.data)}`
+            );
+            summary = `Error generating summary due to OpenAI API issue (Status: ${openaiError.response.status}). Please try again later.`;
+          } else {
+            summary = "Error generating summary. Please try again later.";
+          }
+          // Keep the processed transcript text available even if summary fails
+        }
+      } // End else block for valid transcript length
+    } else {
+      // Handle case where transcript could not be fetched by any method
+      console.error(
+        `[${videoId}] Failed to fetch transcript using all available methods. Last error: ${lastTranscriptError?.message}`
+      );
+
+      // Determine the most likely reason for failure based on last error
+      let userErrorMessage =
+        "Could not retrieve transcript after multiple attempts.";
+      if (
+        lastTranscriptError?.message?.toLowerCase().includes("disabled") ||
+        lastTranscriptError?.message
+          ?.toLowerCase()
+          .includes("no captions data found") ||
+        lastTranscriptError?.message
+          ?.toLowerCase()
+          .includes("no caption tracks found") ||
+        lastTranscriptError?.message?.toLowerCase().includes("api 403") || // Specific API disabled code
+        lastTranscriptError?.message
+          ?.toLowerCase()
+          .includes("no transcript tracks available")
+      ) {
+        userErrorMessage =
+          "Transcripts are disabled or unavailable for this video.";
+      } else if (lastTranscriptError?.name === "AbortError") {
+        userErrorMessage =
+          "Could not retrieve transcript due to network timeouts.";
+      } else if (lastTranscriptError) {
+        // Generic technical failure
+        userErrorMessage = `Could not retrieve transcript due to a technical issue (${
+          lastTranscriptError.name || "Error"
+        }).`;
+      }
+
+      // Return metadata along with the error message
+      return NextResponse.json(
+        {
+          metadata: metadata as PodcastMetadata, // Return fetched metadata (cast to full type)
+          summary: "Transcript unavailable.", // Clear summary
+          transcript: processedTranscriptText, // Contains "Transcript not available."
+          error: userErrorMessage, // Provide specific error reason to UI
+        },
+        { status: 200 }
+      ); // Return 200 OK but indicate transcript failure in payload
+    }
+
+    // Return successful response with metadata and summary
+    console.log(
+      `[${videoId}] Process completed successfully. Returning summary and transcript.`
+    );
+    return NextResponse.json({
+      metadata: metadata as PodcastMetadata, // Cast to full type
+      summary,
+      transcript: processedTranscriptText, // Return the full processed text
+      error: null, // Explicitly null on success
     });
+  } catch (error: any) {
+    // General catch block for unexpected errors (e.g., JSON parsing before videoId is set)
+    const videoIdMsg = videoId
+      ? `for video ID ${videoId}`
+      : "(videoId unknown)";
+    console.error(
+      `[${
+        videoId || "N/A"
+      }] Unhandled error in POST /api/summarize ${videoIdMsg}: ${
+        error.message || error
+      }`,
+      error.stack
+    );
     return NextResponse.json(
-      { error: `Failed to process request: ${error.message}` },
+      {
+        error: `An unexpected server error occurred ${videoIdMsg}. Please check server logs.`,
+      },
       { status: 500 }
     );
   }
 }
+
+// Removed the old fetchPodcastMetadata internal fetch logic
+// Added enhanced logging to catch blocks of transcript fetchers
+// Updated main POST handler to try multiple transcript methods sequentially
+// Updated OpenAI model and prompt structure
+// Improved error handling and user messaging when transcript fetching fails completely
+// Refactored metadata fetching to use shared functions
+// Added TTML parsing fallback to direct fetch
+// Added helper for timestamp parsing

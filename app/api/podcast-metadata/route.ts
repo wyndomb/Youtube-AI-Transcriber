@@ -1,141 +1,71 @@
 import { NextRequest, NextResponse } from "next/server";
+import { fetchMetadataFromYouTubeAPI } from "@/lib/youtube"; // Import the shared function
+import { PodcastMetadata } from "@/components/PodcastMetadata"; // Use correct import path
 
-// Helper function to truncate description
-const truncateDescription = (
-  description: string,
-  maxLength: number = 300
-): string => {
-  if (!description) return "";
-  if (description.length <= maxLength) return description;
-  return description.substring(0, maxLength) + "...";
-};
+// Define a simple type for oEmbed response
+interface OEmbedResponse {
+  title?: string;
+  author_name?: string;
+  thumbnail_url?: string;
+  // Add other fields if needed (e.g., width, height for thumbnail)
+}
 
-// Actual function to fetch YouTube metadata using the YouTube Data API
-const fetchYouTubeMetadata = async (
-  videoId: string,
-  includeFull: boolean = false
-) => {
+// Simple oEmbed fetch function - returns only basic fields matching PodcastMetadata structure
+async function fetchOEmbedMetadata(
+  videoId: string
+): Promise<Partial<PodcastMetadata> | null> {
+  const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
   try {
-    // Use YouTube Data API to get detailed video information
-    const apiKey = process.env.YOUTUBE_API_KEY;
-
-    if (!apiKey) {
-      throw new Error("YouTube API key is not configured");
-    }
-
-    // Fetch detailed video information from the YouTube Data API
-    const videoDetailsUrl = `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&part=snippet,contentDetails,statistics&key=${apiKey}`;
-    const videoResponse = await fetch(videoDetailsUrl);
-
-    if (!videoResponse.ok) {
-      throw new Error(
-        `Failed to fetch video details: ${videoResponse.statusText}`
+    console.log(`Attempting oEmbed fallback for video ID: ${videoId}`);
+    const response = await fetch(url, {
+      next: { revalidate: 3600 },
+      signal: AbortSignal.timeout(8000),
+    }); // Cache & 8s timeout
+    if (!response.ok) {
+      console.error(
+        `oEmbed request failed with status ${response.status} ${response.statusText}`
       );
+      return null;
     }
+    const data: OEmbedResponse = await response.json();
 
-    const videoData = await videoResponse.json();
-
-    if (!videoData.items || videoData.items.length === 0) {
-      throw new Error("No video details found");
-    }
-
-    const videoDetails = videoData.items[0];
-    const snippet = videoDetails.snippet;
-    const contentDetails = videoDetails.contentDetails;
-
-    // Use the YouTube oEmbed API as a fallback for some data
-    const oEmbedResponse = await fetch(
-      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
-    );
-    const oEmbedData = oEmbedResponse.ok ? await oEmbedResponse.json() : null;
-
-    // Format the ISO 8601 duration to a readable format
-    const duration = contentDetails.duration
-      ? formatISODuration(contentDetails.duration)
-      : "Unknown duration";
-
-    const fullDescription =
-      snippet.description || oEmbedData?.title || "No description available.";
-
-    return {
-      title: snippet.title || oEmbedData?.title || "Unknown Title",
-      channelName:
-        snippet.channelTitle || oEmbedData?.author_name || "Unknown Channel",
-      duration: duration,
+    // Map oEmbed response to PodcastMetadata structure
+    const metadata: Partial<PodcastMetadata> = {
       videoId: videoId,
-      description: includeFull
-        ? fullDescription
-        : truncateDescription(fullDescription),
-      fullDescription: fullDescription, // Always include the full description for reference
-      descriptionTruncated: fullDescription.length > 300, // Flag indicating if description was truncated
-      publishedAt: snippet.publishedAt || null,
-      viewCount: videoDetails.statistics?.viewCount || null,
-      likeCount: videoDetails.statistics?.likeCount || null,
-      thumbnails: snippet.thumbnails || null,
-    };
-  } catch (error: any) {
-    console.error("Error fetching YouTube metadata:", error);
-    // Fallback to oEmbed if the YouTube Data API fails
-    try {
-      const oEmbedResponse = await fetch(
-        `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
-      );
-
-      if (oEmbedResponse.ok) {
-        const oEmbedData = await oEmbedResponse.json();
-        return {
-          title: oEmbedData.title || "YouTube Video",
-          channelName: oEmbedData.author_name || "Unknown Channel",
-          duration: "Unknown duration",
-          videoId: videoId,
-          description: "Could not retrieve full video description.",
-          fullDescription: "Could not retrieve full video description.",
-          descriptionTruncated: false,
-        };
-      }
-    } catch (fallbackError) {
-      console.error("Fallback to oEmbed also failed:", fallbackError);
-    }
-
-    // Return basic info with the video ID we have if all else fails
-    return {
-      title: "YouTube Video",
-      channelName: "Unknown Channel",
-      duration: "Unknown duration",
-      videoId: videoId,
-      description: "Could not retrieve video information.",
-      fullDescription: "Could not retrieve video information.",
+      title: data.title || "YouTube Video (oEmbed)",
+      channelName: data.author_name || "Unknown Channel (oEmbed)",
+      // Construct a basic thumbnail object if URL exists
+      thumbnails: data.thumbnail_url
+        ? { default: { url: data.thumbnail_url, width: 0, height: 0 } }
+        : null,
+      duration: "0:00", // oEmbed doesn't provide duration
+      description: "Description unavailable via oEmbed.",
+      fullDescription: "Description unavailable via oEmbed.",
       descriptionTruncated: false,
+      // Other fields like viewCount, likeCount, publishedAt are not available via oEmbed
     };
+    console.log(
+      `Successfully fetched partial metadata via oEmbed fallback for video ID: ${videoId}`
+    );
+    return metadata;
+  } catch (error: any) {
+    if (error.name === "AbortError") {
+      console.error(`oEmbed request timed out for video ID ${videoId}.`);
+    } else {
+      console.error(
+        `Error fetching oEmbed metadata for video ID ${videoId}:`,
+        error.message || error
+      );
+    }
+    return null;
   }
-};
-
-// Helper function to format ISO 8601 duration to readable time
-const formatISODuration = (isoDuration: string): string => {
-  // ISO 8601 duration format: PT#H#M#S
-  const regex = /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/;
-  const matches = isoDuration.match(regex);
-
-  if (!matches) {
-    return "Unknown duration";
-  }
-
-  const hours = matches[1] ? parseInt(matches[1]) : 0;
-  const minutes = matches[2] ? parseInt(matches[2]) : 0;
-  const seconds = matches[3] ? parseInt(matches[3]) : 0;
-
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds
-      .toString()
-      .padStart(2, "0")}`;
-  }
-
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-};
+}
 
 export async function POST(request: NextRequest) {
+  let videoId = ""; // For logging scope
   try {
-    const { url, includeFull } = await request.json();
+    // includeFull is no longer needed as API function gets full description anyway
+    const { url } = await request.json();
 
     // Extract video ID from URL
     const videoIdMatch = url.match(
@@ -149,16 +79,45 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const videoId = videoIdMatch[1];
+    videoId = videoIdMatch[1];
+    console.log(`[${videoId}] Received request for metadata.`);
 
-    // Fetch metadata from YouTube
-    const metadata = await fetchYouTubeMetadata(videoId, includeFull);
+    // Attempt to fetch metadata using the shared YouTube API function
+    let metadata = await fetchMetadataFromYouTubeAPI(videoId);
 
-    return NextResponse.json({ metadata });
-  } catch (error) {
-    console.error("Error processing podcast metadata:", error);
+    // If API fetch fails or returns null, attempt oEmbed fallback
+    if (!metadata) {
+      console.warn(
+        `[${videoId}] YouTube API metadata fetch failed or returned null, attempting oEmbed fallback.`
+      );
+      metadata = await fetchOEmbedMetadata(videoId);
+    }
+
+    // If both methods fail, return an error
+    if (!metadata) {
+      console.error(`[${videoId}] All methods failed to fetch metadata.`);
+      // Return a more specific error message
+      return NextResponse.json(
+        {
+          error: `Failed to fetch podcast metadata for video ${videoId} using all available methods.`,
+        },
+        { status: 500 }
+      );
+    }
+
+    // Return the successful metadata (either from API or oEmbed)
+    console.log(`[${videoId}] Successfully returning metadata.`);
+    // Ensure the returned object matches the expected structure (even if partial)
+    return NextResponse.json({ metadata: metadata as PodcastMetadata }); // Cast to full type if confident, otherwise handle partial data downstream
+  } catch (error: any) {
+    // Catch potential errors during request parsing or ID extraction
+    const idSuffix = videoId ? ` for video ${videoId}` : "";
+    console.error(
+      `Error processing podcast metadata request${idSuffix}:`,
+      error.message || error
+    );
     return NextResponse.json(
-      { error: "Failed to fetch podcast metadata" },
+      { error: `Internal server error processing metadata request${idSuffix}` },
       { status: 500 }
     );
   }
