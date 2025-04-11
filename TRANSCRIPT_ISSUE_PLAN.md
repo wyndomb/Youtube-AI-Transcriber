@@ -6,45 +6,48 @@ This document outlines our systematic approach to resolving the YouTube transcri
 
 - ✅ Application works correctly in local development environment
 - ❌ Application fails on Vercel deployment with multiple errors:
-  - `Failed to fetch video transcript: [YoutubeTranscript] 🚨 Transcript is disabled on this video`
-  - `Failed to fetch metadata: Unauthorized`
-  - `No captions data found in video page`
+  - ✅ Metadata fetching fixed (API Key Referrer Restriction)
+  - ❌ Transcript fetching still failing on Vercel (Direct & Innertube methods) - `No captions data found...`, `No caption tracks found...`
 
 ## Hypotheses
 
 1. **CORS Restrictions**: Vercel's environment may have stricter CORS policies than local development
-2. **YouTube IP Blocking**: YouTube may be blocking or restricting requests from Vercel's server IP ranges
-3. **Library Compatibility**: The transcript fetching library might not be compatible with Vercel's serverless environment
-4. **Authentication/Headers**: The requests from Vercel might be missing necessary headers or user-agent information
+2. **YouTube IP Blocking / Page Structure Differences**: YouTube may be blocking requests or serving different HTML/data structures to Vercel's server IP ranges compared to local development (HIGHLY LIKELY for transcript failures)
+3. **Library Compatibility**: The transcript fetching library might not be compatible with Vercel's serverless environment (Mitigated by custom implementation)
+4. **Authentication/Headers**: The requests from Vercel might be missing necessary headers or user-agent information (Partially addressed by adding Accept-Language)
 5. **Server vs. Client Execution**: The code might be executing in a different context (client vs server) on Vercel
-6. **YouTube Page Structure**: The structure of YouTube pages might be different when accessed from Vercel's IP ranges
-7. **API Key Issues**: The YouTube API key might not be properly configured in Vercel or might have restrictions
-8. **Page Format Changes**: YouTube might be serving different HTML formats for different client types
+6. ~~YouTube Page Structure~~: (Covered by Hypothesis 2)
+7. ~~API Key Issues~~: (Resolved for metadata, but potentially still relevant if API method for transcripts is used/enabled)
+8. ~~Page Format Changes~~: (Covered by Hypothesis 2)
 
 ## Current Diagnosis
 
-Initial diagnosis indicated that the YouTube API key was missing from the Vercel environment. This was added, but the issue persisted. Further investigation revealed several key issues:
+Initial diagnosis indicated issues with API keys and URL construction. Further investigation and fixes revealed:
 
-1. The URL construction for internal API calls was missing the proper protocol prefix on Vercel deployments
-2. YouTube transcript fetching may be blocked by YouTube when coming from Vercel IP addresses
-3. YouTube returns different page structures when accessed from cloud providers vs. residential IPs
-4. The regex pattern used to extract captions data was failing on certain videos
-5. The podcast metadata API was failing with an "Unauthorized" error, likely due to YouTube API key issues or restrictions
+1. ~~URL construction for internal API calls was missing the proper protocol prefix~~ (Fixed by refactoring).
+2. **YouTube returns different page structures/data when accessed from cloud providers (Vercel) vs. residential IPs**. This is the primary suspected cause for ongoing transcript failures for Direct/Innertube methods.
+3. The specific regex patterns and JSON parsing logic for extracting captions/transcript URLs were failing on the data received in the Vercel environment.
+4. ✅ **The YouTube Data API metadata fetch failed due to API Key HTTP Referrer restrictions**. This was resolved by removing the restriction in Google Cloud Console, allowing server-side calls.
 
 ## Implemented Solution
 
 We've addressed these issues with a multi-faceted approach:
 
-1. Added more detailed logging to track down the exact point of failure
-2. Fixed the URL construction for internal API calls to include the proper protocol
-3. Implemented a custom fallback method for transcript fetching that uses a direct approach with browser-like headers
-4. Added retry logic to try multiple methods of fetching transcripts
-5. Implemented multiple regex patterns to extract captions from different YouTube page structures
-6. Added timeout handling for HTTP requests to prevent hanging in error cases
-7. Improved error handling and user-facing error messages
-8. Added direct fallbacks for podcast metadata using oEmbed instead of the YouTube API
-9. Implemented YouTube's Innertube API approach for transcript fetching as a new fallback method
-10. Provided more robust error handling to present useful information to the user even when transcripts can't be fetched
+1. Added more detailed logging to track down the exact point of failure (including HTML/JSON snippets on failure).
+2. Fixed the URL construction for internal API calls by refactoring to direct function calls.
+3. Implemented custom fallback methods (`Direct`, `Innertube`) for transcript fetching with browser-like headers (`User-Agent`, `Accept-Language`).
+4. Added retry logic to try multiple methods of fetching transcripts (Library -> Direct -> Innertube).
+5. **Refactored transcript fetching logic into a dedicated library (`lib/youtube-transcript.ts`)**.
+6. Implemented detailed parsing logic within `lib/youtube-transcript.ts` including:
+   - Multiple regex patterns to extract captions data from HTML.
+   - Logic to find and select the transcript `baseUrl`.
+   - Fetching the transcript XML/TTML content.
+   - Parsing both XML (`<text>`) and TTML (`<p>`) formats.
+7. Added timeout handling for HTTP requests.
+8. Improved error handling and user-facing error messages.
+9. Added direct oEmbed fallback for metadata.
+10. Enhanced the Innertube method with key/context extraction and a fallback to direct HTML parsing if its API calls fail.
+11. Provided more robust error handling to present useful information to the user even when transcripts can't be fetched.
 
 ### Phase 1: Initial Diagnosis & Fixes
 
@@ -60,71 +63,81 @@ We've addressed these issues with a multi-faceted approach:
 
 ✅ **3.1 Multiple Approach Strategy**
 
-- Implemented 4 different methods to get transcripts: standard library, direct fetch, YouTube API, and Innertube API
-- Added cascading fallbacks to try all methods before failing
-- Improved regex patterns for all extraction methods
+- Implemented multiple methods: standard library, direct fetch, Innertube API (API method currently disabled/commented out).
+- Added cascading fallbacks to try all methods before failing.
+- Improved regex patterns for HTML data extraction.
+- Added parsing logic for both XML and TTML transcript formats.
+- Enhanced Innertube with fallback to direct HTML parsing.
 
 ✅ **3.2 API Key & Authentication**
 
-- Added fallbacks for when the YouTube API key is missing or restricted
-- Implemented direct oEmbed approach for metadata that doesn't require API key
+- **Fixed YouTube Data API key HTTP referrer restriction**, enabling metadata fetch from Vercel server-side.
+- Implemented direct oEmbed approach for metadata fallback.
 
 ✅ **3.3 Enhanced Error Handling**
 
-- Improved error classification and user-friendly messages
-- Return metadata even when transcript fetching fails
-- Added specific handling for different error types
+- Improved error classification and user-friendly messages.
+- Return metadata even when transcript fetching fails.
+- Added specific handling for different error types (timeouts, parsing, etc.).
+- Added detailed logging within `catch` blocks and parsing functions for better Vercel diagnostics.
 
 ✅ **3.4 YouTube Innertube API**
 
-- Implemented YouTube's internal API approach for transcript fetching
-- Added multiple patterns for extracting necessary tokens from the page
-- Included fallbacks at every level of the process
+- Implemented YouTube's internal API approach for transcript fetching.
+- Added dynamic extraction for API key and client context from page HTML.
+- Included fallbacks at every level of the process (including parsing initial HTML if API fails).
+
+✅ **3.5 API Refactoring (Commit dd95513)**
+
+- **Centralized Metadata Fetching**: Created `lib/youtube.ts`.
+- **Removed Internal API Call**: Refactored routes to call `fetchMetadataFromYouTubeAPI` directly.
+- **Standardized Fallbacks**: Consistent oEmbed fallback.
+- **Improved Sequential Transcript Logic**: Refined sequence in `/api/summarize/route.ts`.
+
+✅ **3.6 Transcript Library Refactoring (Commits d4f2b4a, dcd558b, 1c7f63d)**
+
+- **Moved Transcript Logic**: Created `lib/youtube-transcript.ts` to house fetching and parsing functions (`fetchTranscriptDirect`, `fetchTranscriptInnertube`, `extractAndParseTranscriptFromHtml`, `parseTimestamp`).
+- **Added Type Definitions**: Defined `TranscriptLine` interface.
+- **Implemented Parsing**: Moved and refined HTML data extraction and XML/TTML parsing logic into the library file.
+- **Enhanced Logging**: Added more detailed logs within the library functions.
+- **Fixed Build Issues**: Resolved type errors related to the refactoring.
 
 ## Monitoring and Validation
 
 For the implemented solution:
 
-1. Deploy to Vercel
-2. Test with at least 3 different YouTube videos:
-   - One with known captions
-   - One with auto-generated captions
-   - One in a non-English language
-3. Monitor logs for any errors
-4. Test with the specific video ID that previously failed: b9gPwO-IsB4
-5. Check if metadata is returned even when transcript fetching fails
+1. Deploy latest commit (1c7f63d) to Vercel.
+2. Test with the specific video ID that previously failed: `b9gPwO-IsB4`.
+3. **Monitor Vercel logs closely** for output from `lib/youtube-transcript.ts`:
+   - Regex matching success/failure (`Found potential captions data...`, `No captions data found...`).
+   - Transcript URL used (`Using transcript URL...`).
+   - Transcript content fetching/parsing errors (`Failed to fetch transcript content...`, `Failed to parse transcript content...`, `Invalid or empty transcript content...`).
+   - Innertube specific logs (`Extracting transcript data from HTML...`, `Attempting Innertube API Strategy...`, `Extracted Innertube Key...`, `Innertube Player API request failed...`, `No caption tracks found in Innertube player response`).
+4. Check if transcripts are successfully retrieved and displayed.
+5. Test with other videos (with captions, auto-generated, non-English) to ensure no regressions.
 
 ## Success Criteria
 
-- Application successfully retrieves transcripts for videos that have them available
-- Application properly handles and communicates when transcripts are unavailable
-- Solution works consistently across multiple videos and over time
-- User receives helpful error messages when transcripts cannot be fetched
-- Basic functionality continues to work even when some components fail (graceful degradation)
+- Application successfully retrieves transcripts for videos that have them available **on Vercel**.
+- Application properly handles and communicates when transcripts are unavailable.
+- Solution works consistently across multiple videos and over time.
+- User receives helpful error messages when transcripts cannot be fetched.
+- Basic functionality continues to work even when some components fail (graceful degradation).
 
 ## Future Enhancements (If Needed)
 
-- [ ] **YouTube Data API for Captions**
-
-  - Explore the use of the official YouTube Data API to fetch captions (requires OAuth)
-  - This would be more reliable but more complex to implement
-
-- [ ] **Alternative Libraries**
-
-  - Research and test alternative YouTube transcript libraries
-  - Evaluate newer libraries that might handle server-side environments better
-
-- [ ] **Proxy Solution**
-  - Create a proxy API endpoint that forwards requests to YouTube from a non-Vercel IP
-  - Consider using a serverless function on a different provider or a dedicated server
+- [ ] **Refine Regex/Parsing**: If logs show specific failures, adjust patterns in `extractAndParseTranscriptFromHtml`.
+- [ ] **Proxy Solution**: If direct Vercel IPs remain blocked/served different content, consider a proxy.
+- [ ] **YouTube Data API for Captions**: Explore OAuth for official caption fetching if custom methods prove too unstable.
+- [ ] **Alternative Libraries**: Re-evaluate third-party libraries if custom solution becomes unmaintainable.
 
 ## Implementation Notes
 
-Each attempted solution has significantly improved our resilience and error handling. Our current approach tries multiple methods before failing, provides clear error messages, and gracefully degrades by providing metadata even when transcripts can't be fetched.
+Metadata fetching is now stable after fixing the API key restrictions. The primary focus is on the transcript fetching instability within the Vercel environment. The refactoring into `lib/youtube-transcript.ts` centralizes the logic, and the detailed logging added should pinpoint the exact failure point (HTML structure mismatch, parsing error, etc.) when run on Vercel. The Innertube method now includes fallbacks to direct HTML parsing, increasing its resilience.
 
 ## Rollback Plan
 
 If any implementation significantly degrades the application:
 
-- Revert to the previous working deployment
-- Document what caused the issue for future reference
+- Revert to the previous working deployment (e.g., commit `dcd558b` before parsing implementation if necessary).
+- Document what caused the issue for future reference.
