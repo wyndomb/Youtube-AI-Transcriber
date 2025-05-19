@@ -380,8 +380,7 @@ async function extractAndParseTranscriptFromHtml(
                 console.error(
                   `[${videoId}] Failed to parse ytInitialData. Error: ${e.message}`
                 );
-                const errorPositionMatch =
-                  e.message.match(/position\\s+(\\d+)/);
+                const errorPositionMatch = e.message.match(/(\d+)/);
                 if (errorPositionMatch && errorPositionMatch[1]) {
                   const errorPos = parseInt(errorPositionMatch[1], 10);
                   const contextChars = 100;
