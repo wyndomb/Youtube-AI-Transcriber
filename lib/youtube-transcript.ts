@@ -4,6 +4,9 @@ interface TranscriptLine {
   offset: number;
 }
 
+// Export the interface to be used in other modules
+export type { TranscriptLine };
+
 // Helper to parse HH:MM:SS.ms format to seconds
 function parseTimestamp(timestamp: string): number {
   const parts = timestamp.split(":");
@@ -883,3 +886,190 @@ async function fetchTranscriptInnertube(
     throw error; // Let the calling sequence handle the failure logging for this method
   }
 }
+
+// Helper function to check if video likely has no captions available
+async function checkIfCaptionsUnavailable(videoId: string): Promise<boolean> {
+  try {
+    // Fetch the video page to look for indicators that captions are unavailable
+    const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: getBrowserLikeHeaders(),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      return false; // Can't determine, don't assume unavailable
+    }
+
+    const html = await response.text();
+
+    // Check for markers that indicate no captions
+    const noSubtitlesIndicators = [
+      'class="ytp-subtitles-button ytp-button" style="display: none;"', // Subtitle button hidden
+      '"captionTracks":[]', // Empty captions tracks array
+      '"hasCaptions":false', // Explicit indicator
+    ];
+
+    for (const indicator of noSubtitlesIndicators) {
+      if (html.includes(indicator)) {
+        console.log(
+          `[${videoId}] Found indicator that captions are unavailable: ${indicator}`
+        );
+        return true;
+      }
+    }
+
+    // Check video metadata section for captions flag - without using 's' flag
+    const playerResponseMatch = html.match(
+      /"playerResponse":\s*(\{[\s\S]*?\}\});/
+    );
+    if (playerResponseMatch && playerResponseMatch[1]) {
+      try {
+        const playerData = JSON.parse(playerResponseMatch[1]);
+        if (playerData?.videoDetails?.isCrawlable === false) {
+          console.log(
+            `[${videoId}] Video is marked as not crawlable, captions likely unavailable`
+          );
+          return true;
+        }
+
+        // Check if captions are explicitly disabled
+        if (
+          playerData?.captions?.playerCaptionsTracklistRenderer
+            ?.captionTracks === undefined ||
+          (Array.isArray(
+            playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+          ) &&
+            playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+              .length === 0)
+        ) {
+          console.log(
+            `[${videoId}] No caption tracks found in player response`
+          );
+          return true;
+        }
+      } catch (e) {
+        console.warn(`[${videoId}] Error parsing player response:`, e);
+      }
+    }
+
+    return false; // No clear indication that captions are unavailable
+  } catch (error) {
+    console.warn(
+      `[${videoId}] Error checking if captions are unavailable:`,
+      error
+    );
+    return false; // Can't determine, don't assume unavailable
+  }
+}
+
+// Export the main transcript fetching functions
+export async function fetchTranscript(
+  videoId: string
+): Promise<TranscriptLine[] | null> {
+  console.log(
+    `[${videoId}] Starting transcript fetching sequence with all methods...`
+  );
+  let lastError: Error | null = null;
+
+  // First check if captions are likely unavailable to avoid unnecessary attempts
+  const captionsLikelyUnavailable = await checkIfCaptionsUnavailable(videoId);
+  if (captionsLikelyUnavailable) {
+    console.log(
+      `[${videoId}] Pre-check indicates captions are unavailable for this video`
+    );
+    throw new Error(
+      "This video doesn't have captions or has disabled captions. Consider using a video with captions or a different video."
+    );
+  }
+
+  // Try each method in sequence
+  try {
+    console.log(`[${videoId}] Trying transcript method: Library...`);
+    const transcript = await fetchTranscriptLibrary(videoId);
+    if (transcript && transcript.length > 0) {
+      console.log(
+        `[${videoId}] Transcript successfully fetched using method: Library (${transcript.length} segments).`
+      );
+      return transcript;
+    }
+  } catch (error: any) {
+    console.warn(`[${videoId}] Transcript method Library failed.`);
+    lastError = error;
+  }
+
+  try {
+    console.log(`[${videoId}] Trying transcript method: Direct...`);
+    const transcript = await fetchTranscriptDirect(videoId);
+    if (transcript && transcript.length > 0) {
+      console.log(
+        `[${videoId}] Transcript successfully fetched using method: Direct (${transcript.length} segments).`
+      );
+      return transcript;
+    }
+  } catch (error: any) {
+    console.warn(`[${videoId}] Transcript method Direct failed.`);
+    lastError = error;
+  }
+
+  try {
+    console.log(`[${videoId}] Trying transcript method: Innertube...`);
+    const transcript = await fetchTranscriptInnertube(videoId);
+    if (transcript && transcript.length > 0) {
+      console.log(
+        `[${videoId}] Transcript successfully fetched using method: Innertube (${transcript.length} segments).`
+      );
+      return transcript;
+    } else if (transcript === null) {
+      console.warn(
+        `[${videoId}] Transcript method Innertube completed but returned null/undefined.`
+      );
+    }
+  } catch (error: any) {
+    console.warn(`[${videoId}] Transcript method Innertube failed.`);
+    lastError = error;
+  }
+
+  // If we get here, all methods failed
+  if (lastError) {
+    // Check errors for specific patterns
+    if (
+      lastError.message.includes("No captions data found") ||
+      lastError.message.includes("No valid transcript URL found") ||
+      lastError.message.includes("Transcript tracks unavailable")
+    ) {
+      console.error(
+        `[${videoId}] This video doesn't appear to have captions available.`
+      );
+      throw new Error(
+        "This video doesn't have captions or has disabled captions. Consider using a video with captions or a different video."
+      );
+    } else {
+      console.error(
+        `[${videoId}] Failed to fetch transcript using all available methods. Last error: ${lastError.message}`
+      );
+      throw lastError;
+    }
+  } else {
+    console.error(
+      `[${videoId}] Failed to fetch transcript using all available methods. Last error: Unknown`
+    );
+    throw new Error(
+      "Failed to fetch transcript using all available methods. The video may not have captions available."
+    );
+  }
+}
+
+// Simple wrapper for the third-party library
+async function fetchTranscriptLibrary(
+  videoId: string
+): Promise<TranscriptLine[]> {
+  // This would normally use the third-party library, but since we have our own implementation,
+  // we can throw an error that will cause the sequence to try the next method
+  throw new Error("Library method not implemented");
+}
+
+export {
+  fetchTranscriptDirect,
+  fetchTranscriptInnertube,
+  extractAndParseTranscriptFromHtml,
+};

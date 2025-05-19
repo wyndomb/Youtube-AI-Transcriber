@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
-import { YoutubeTranscript, TranscriptConfig } from "youtube-transcript";
+// Replace the youtube-transcript npm package with our custom implementation
+// import { YoutubeTranscript, TranscriptConfig } from "youtube-transcript";
+import { fetchTranscript, TranscriptLine } from "@/lib/youtube-transcript";
 import OpenAI from "openai";
 import { fetchMetadataFromYouTubeAPI } from "@/lib/youtube";
 import { PodcastMetadata } from "@/components/PodcastMetadata";
@@ -897,331 +899,254 @@ async function fetchYouTubeTranscriptViaInnertubeAPI(videoId: string) {
 
 // Main POST handler (modified to handle metadata failure and try multiple transcript methods)
 export async function POST(request: Request) {
-  let videoId = ""; // Initialize videoId for broader scope logging
+  // Extract the videoId from the request body
+  let reqData;
   try {
-    const { url } = await request.json();
-
-    // Extract video ID
-    const videoIdMatch = url.match(
-      /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/))([^&?\s]+)/
+    reqData = await request.json();
+  } catch (error) {
+    return NextResponse.json(
+      { error: "Invalid request body" },
+      { status: 400 }
     );
+  }
 
-    if (!videoIdMatch) {
-      console.error("Invalid YouTube URL received:", url);
-      return NextResponse.json(
-        { error: "Invalid YouTube URL format." },
-        { status: 400 }
-      );
-    }
-    videoId = videoIdMatch[1];
+  const { videoId } = reqData;
 
-    // --- Fetch Metadata ---
-    console.log(`[${videoId}] Starting process: Fetching metadata...`);
-    // Use Partial<PodcastMetadata> as the functions return partial data
-    const metadata: Partial<PodcastMetadata> | null =
-      await fetchPodcastMetadataForSummarize(videoId);
-
-    if (!metadata) {
-      console.error(
-        `[${videoId}] Critical failure: Could not fetch required metadata after all attempts.`
-      );
-      return NextResponse.json(
-        {
-          error:
-            "Failed to fetch essential video metadata. The video might be private, deleted, or there could be an issue with the YouTube API/oEmbed services.",
-        },
-        { status: 500 } // Internal Server Error might be more appropriate than 404
-      );
-    }
-    // Log only essential metadata fields fetched
-    console.log(
-      `[${videoId}] Metadata fetched (Title: ${metadata.title}, Channel: ${metadata.channelName}). Proceeding...`
+  if (!videoId) {
+    return NextResponse.json(
+      { error: "Missing videoId parameter" },
+      { status: 400 }
     );
+  }
 
-    // --- Transcript Fetching Logic with Fallbacks ---
-    let transcript: any = null; // Use 'any' or a specific transcript segment type
-    let lastTranscriptError: Error | null = null;
-    const transcriptMethods = [
-      {
-        name: "Library",
-        func: () =>
-          YoutubeTranscript.fetchTranscript(videoId, {
-            lang: "en",
-          } as TranscriptConfig),
-      }, // Specify lang if possible
-      { name: "Direct", func: () => fetchYouTubeTranscriptDirectly(videoId) },
-      // { name: 'API', func: () => fetchYouTubeTranscriptViaAPI(videoId) }, // Often requires OAuth, less reliable with key alone. Uncomment if OAuth is implemented or key works.
-      {
-        name: "Innertube",
-        func: () => fetchYouTubeTranscriptViaInnertubeAPI(videoId),
-      },
-    ];
+  console.log(`[${videoId}] Processing summarize request...`);
 
-    console.log(`[${videoId}] Starting transcript fetching sequence...`);
-    for (const method of transcriptMethods) {
-      try {
-        console.log(`[${videoId}] Trying transcript method: ${method.name}...`);
-        // Ensure the function call is awaited
-        transcript = await method.func();
-        // Check if transcript is valid (not null and has content)
-        if (transcript && Array.isArray(transcript) && transcript.length > 0) {
-          console.log(
-            `[${videoId}] Transcript successfully fetched using method: ${method.name} (${transcript.length} segments).`
-          );
-          break; // Exit loop on success
-        } else if (
-          transcript &&
-          Array.isArray(transcript) &&
-          transcript.length === 0
-        ) {
-          // Handle cases where the function returns empty array without throwing an error
-          console.warn(
-            `[${videoId}] Transcript method ${method.name} completed but returned an empty array.`
-          );
-          lastTranscriptError = new Error(
-            `Method ${method.name} returned empty transcript array.`
-          );
-        } else if (!transcript) {
-          console.warn(
-            `[${videoId}] Transcript method ${method.name} completed but returned null/undefined.`
-          );
-          lastTranscriptError = new Error(
-            `Method ${method.name} returned null/undefined.`
-          );
-        }
-      } catch (error: any) {
-        console.warn(`[${videoId}] Transcript method ${method.name} failed.`); // Detailed log happens inside function
-        lastTranscriptError = error; // Store the last error encountered
-        // Specific handling for common library errors
-        if (method.name === "Library") {
-          if (error.message?.includes("[YoutubeTranscript]")) {
-            // Check for specific known library errors like "disabled" or "no captions"
-            if (
-              error.message.toLowerCase().includes("disabled") ||
-              error.message.toLowerCase().includes("no captions")
-            ) {
-              console.log(
-                `[${videoId}] Library indicates transcript unavailable/disabled.`
-              );
-            }
-          }
-        }
-        // If direct or innertube fail with "disabled" or "no captions found", log it
-        if (
-          (method.name === "Direct" || method.name === "Innertube") &&
-          (error.message?.toLowerCase().includes("disabled") ||
-            error.message?.toLowerCase().includes("no captions data found") ||
-            error.message?.toLowerCase().includes("no caption tracks found"))
-        ) {
-          console.log(
-            `[${videoId}] ${method.name} method indicates transcript unavailable/disabled.`
-          );
-        }
-      }
-    }
-
-    // --- Process Transcript (if fetched) ---
-    let summary = "Could not generate summary."; // Default summary
-    let processedTranscriptText = "Transcript not available.";
-
-    if (transcript && Array.isArray(transcript) && transcript.length > 0) {
-      console.log(
-        `[${videoId}] Transcript obtained (${transcript.length} segments), proceeding to format and summarize...`
-      );
-      // Join transcript segments into a single string
-      processedTranscriptText = transcript
-        .map((item: { text: string }) => item.text)
-        .join(" ");
-
-      // Basic check for meaningful transcript content
-      if (processedTranscriptText.trim().length < 50) {
-        // Arbitrary short length check
-        console.warn(
-          `[${videoId}] Transcript text seems very short (${
-            processedTranscriptText.trim().length
-          } chars), summary might be poor.`
-        );
-        summary =
-          "Summary could not be generated (transcript content was too short or invalid).";
-        processedTranscriptText =
-          "Transcript content appears invalid or too short.";
-        // Decide if we should still return 200 or an error state
-        return NextResponse.json(
-          {
-            metadata: metadata as PodcastMetadata, // Return metadata
-            summary: summary,
-            transcript: processedTranscriptText,
-            error: "Transcript content invalid/short.",
-          },
-          { status: 200 }
-        ); // Return 200 OK but indicate transcript issue in payload
-      } else {
-        // --- Summarization Logic ---
-        try {
-          const MAX_TRANSCRIPT_LENGTH = 100000; // gpt-4o-mini has large context, but keep reasonable limit
-          let transcriptForPrompt = processedTranscriptText;
-          if (processedTranscriptText.length > MAX_TRANSCRIPT_LENGTH) {
-            console.warn(
-              `[${videoId}] Transcript length (${processedTranscriptText.length}) exceeds limit (${MAX_TRANSCRIPT_LENGTH}), truncating.`
-            );
-            transcriptForPrompt = processedTranscriptText.substring(
-              0,
-              MAX_TRANSCRIPT_LENGTH
-            );
-          }
-
-          // Construct a more detailed prompt
-          const prompt = `
-                  **Analyze the following podcast transcript:**
-
-                  **Metadata:**
-                  - Title: ${metadata.title || "N/A"}
-                  - Channel: ${metadata.channelName || "N/A"}
-                  ${metadata.duration ? `- Duration: ${metadata.duration}` : ""}
-
-                  **Transcript:**
-                  """
-                  ${transcriptForPrompt}
-                  """
-
-                  **Instructions:**
-                  Generate a comprehensive yet concise summary in Markdown format. Structure the summary with the following sections, ensuring each section has meaningful content derived *only* from the provided transcript and metadata. If a section cannot be populated from the text, omit it or state "Not applicable based on transcript."
-
-                  1.  **Executive Summary:** (1-2 paragraphs capturing the core essence and main topics discussed).
-                  2.  **Key Insights:** (3-5 distinct bullet points highlighting the most important takeaways, arguments, or findings).
-                  3.  **Notable Quotes:** (2-3 impactful or representative quotes directly from the transcript, correctly attributed if possible, otherwise just list the quote).
-                  4.  **Potential Action Items / Further Questions:** (1-3 actionable suggestions or thought-provoking questions raised by the content).
-
-                  **Formatting Requirements:**
-                  - Use standard Markdown (headers, bolding, lists).
-                  - Ensure clarity, accuracy, and conciseness.
-                  - Do NOT add any introductory or concluding phrases outside of the requested sections.
-                  - Output only the Markdown content.
-               `;
-
-          console.log(
-            `[${videoId}] Sending request to OpenAI (gpt-4o-mini) for summarization...`
-          );
-          const response = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [{ role: "user", content: prompt }],
-            max_tokens: 1200, // Increased slightly for potentially longer summaries
-            temperature: 0.5,
-            // stop: ["\n\n"], // Optional: control stop sequences if needed
-          });
-          console.log(`[${videoId}] OpenAI summarization response received.`);
-
-          if (
-            !response.choices ||
-            response.choices.length === 0 ||
-            !response.choices[0].message?.content
-          ) {
-            // Log the API response if available and failed
-            console.error(
-              `[${videoId}] Invalid or empty response received from OpenAI. Response:`,
-              JSON.stringify(response, null, 2)
-            );
-            throw new Error("Invalid or empty response received from OpenAI.");
-          }
-
-          summary = response.choices[0].message.content.trim();
-        } catch (openaiError: any) {
-          console.error(
-            `[${videoId}] Error during OpenAI summarization: ${
-              openaiError.message || openaiError
-            }`
-          );
-          // Check for specific OpenAI errors (e.g., rate limits, content policy)
-          if (openaiError.response) {
-            // Check if it's an API error response
-            console.error(
-              `[${videoId}] OpenAI API Error Details: Status ${
-                openaiError.response.status
-              }, Data: ${JSON.stringify(openaiError.response.data)}`
-            );
-            summary = `Error generating summary due to OpenAI API issue (Status: ${openaiError.response.status}). Please try again later.`;
-          } else {
-            summary = "Error generating summary. Please try again later.";
-          }
-          // Keep the processed transcript text available even if summary fails
-        }
-      } // End else block for valid transcript length
-    } else {
-      // Handle case where transcript could not be fetched by any method
-      console.error(
-        `[${videoId}] Failed to fetch transcript using all available methods. Last error: ${lastTranscriptError?.message}`
-      );
-
-      // Determine the most likely reason for failure based on last error
-      let userErrorMessage =
-        "Could not retrieve transcript after multiple attempts.";
-      if (
-        lastTranscriptError?.message?.toLowerCase().includes("disabled") ||
-        lastTranscriptError?.message
-          ?.toLowerCase()
-          .includes("no captions data found") ||
-        lastTranscriptError?.message
-          ?.toLowerCase()
-          .includes("no caption tracks found") ||
-        lastTranscriptError?.message?.toLowerCase().includes("api 403") || // Specific API disabled code
-        lastTranscriptError?.message
-          ?.toLowerCase()
-          .includes("no transcript tracks available")
-      ) {
-        userErrorMessage =
-          "Transcripts are disabled or unavailable for this video.";
-      } else if (lastTranscriptError?.name === "AbortError") {
-        userErrorMessage =
-          "Could not retrieve transcript due to network timeouts.";
-      } else if (lastTranscriptError) {
-        // Generic technical failure
-        userErrorMessage = `Could not retrieve transcript due to a technical issue (${
-          lastTranscriptError.name || "Error"
-        }).`;
-      }
-
-      // Return metadata along with the error message
-      return NextResponse.json(
-        {
-          metadata: metadata as PodcastMetadata, // Return fetched metadata (cast to full type)
-          summary: "Transcript unavailable.", // Clear summary
-          transcript: processedTranscriptText, // Contains "Transcript not available."
-          error: userErrorMessage, // Provide specific error reason to UI
-        },
-        { status: 200 }
-      ); // Return 200 OK but indicate transcript failure in payload
-    }
-
-    // Return successful response with metadata and summary
-    console.log(
-      `[${videoId}] Process completed successfully. Returning summary and transcript.`
-    );
-    return NextResponse.json({
-      metadata: metadata as PodcastMetadata, // Cast to full type
-      summary,
-      transcript: processedTranscriptText, // Return the full processed text
-      error: null, // Explicitly null on success
-    });
+  // Fetch YouTube metadata
+  console.log(`[${videoId}] Fetching video metadata...`);
+  let metadata = null;
+  let metadataError = null;
+  try {
+    metadata = await fetchMetadataFromYouTubeAPI(videoId);
+    console.log(`[${videoId}] Metadata successfully fetched.`);
   } catch (error: any) {
-    // General catch block for unexpected errors (e.g., JSON parsing before videoId is set)
-    const videoIdMsg = videoId
-      ? `for video ID ${videoId}`
-      : "(videoId unknown)";
     console.error(
-      `[${
-        videoId || "N/A"
-      }] Unhandled error in POST /api/summarize ${videoIdMsg}: ${
-        error.message || error
-      }`,
-      error.stack
+      `[${videoId}] Error fetching metadata from YouTube API:`,
+      error.message || error
     );
+    metadataError = error.message || "Unknown error fetching metadata";
+
+    // Try fallback via oEmbed
+    try {
+      metadata = await fetchOEmbedMetadataForSummarize(videoId);
+      if (metadata) {
+        console.log(
+          `[${videoId}] Partial metadata retrieved via oEmbed fallback.`
+        );
+        metadataError = null; // Clear error if fallback succeeded
+      }
+    } catch (fallbackError: any) {
+      console.error(
+        `[${videoId}] Fallback oEmbed metadata fetch also failed:`,
+        fallbackError.message || fallbackError
+      );
+    }
+  }
+
+  // --- Transcript Fetching Logic with Fallbacks ---
+  // Update the transcript fetching to use our custom implementation
+  let transcript: any = null; // Use 'any' or a specific transcript segment type
+  let lastTranscriptError: Error | null = null;
+
+  try {
+    // Try our custom implementation from the lib
+    console.log(
+      `[${videoId}] Attempting to fetch transcript with custom library...`
+    );
+    transcript = await fetchTranscript(videoId);
+    if (transcript && transcript.length > 0) {
+      console.log(
+        `[${videoId}] Successfully fetched transcript using custom implementation.`
+      );
+    } else {
+      console.warn(
+        `[${videoId}] Custom implementation returned empty transcript.`
+      );
+      throw new Error("No transcript content returned");
+    }
+  } catch (error: any) {
+    console.error(
+      `[${videoId}] Error fetching transcript:`,
+      error.message || error
+    );
+    lastTranscriptError = error;
+
+    // If this is a specific error about captions not being available,
+    // we'll handle it differently in the UI response
+    if (
+      error.message.includes("doesn't have captions") ||
+      error.message.includes("has disabled captions")
+    ) {
+      return NextResponse.json(
+        {
+          error: "CAPTIONS_UNAVAILABLE",
+          message: error.message,
+          metadata: metadata || null,
+        },
+        { status: 404 }
+      );
+    }
+  }
+
+  // If we still don't have a valid transcript, return an error
+  if (!transcript || transcript.length === 0) {
     return NextResponse.json(
       {
-        error: `An unexpected server error occurred ${videoIdMsg}. Please check server logs.`,
+        error: "TRANSCRIPT_FETCH_FAILED",
+        message: lastTranscriptError?.message || "Failed to fetch transcript",
+        metadata: metadata || null,
       },
       { status: 500 }
     );
   }
+
+  // ... rest of the code remains the same
+
+  // Replace this comment with the actual processing code:
+  // Process the transcript and generate a summary
+  console.log(
+    `[${videoId}] Transcript obtained (${transcript.length} segments), proceeding to format and summarize...`
+  );
+
+  // Join transcript segments into a single string
+  let processedTranscriptText = transcript
+    .map((item: { text: string }) => item.text)
+    .join(" ");
+
+  // Basic check for meaningful transcript content
+  let summary = "Could not generate summary."; // Default summary
+
+  if (processedTranscriptText.trim().length < 50) {
+    // Arbitrary short length check
+    console.warn(
+      `[${videoId}] Transcript text seems very short (${
+        processedTranscriptText.trim().length
+      } chars), summary might be poor.`
+    );
+    summary =
+      "Summary could not be generated (transcript content was too short or invalid).";
+    processedTranscriptText =
+      "Transcript content appears invalid or too short.";
+
+    return NextResponse.json(
+      {
+        metadata: metadata, // Return metadata
+        summary: summary,
+        transcript: processedTranscriptText,
+        error: "Transcript content invalid/short.",
+      },
+      { status: 200 }
+    );
+  }
+
+  // --- Summarization Logic ---
+  try {
+    const MAX_TRANSCRIPT_LENGTH = 100000; // gpt-4o-mini has large context, but keep reasonable limit
+    let transcriptForPrompt = processedTranscriptText;
+    if (processedTranscriptText.length > MAX_TRANSCRIPT_LENGTH) {
+      console.warn(
+        `[${videoId}] Transcript length (${processedTranscriptText.length}) exceeds limit (${MAX_TRANSCRIPT_LENGTH}), truncating.`
+      );
+      transcriptForPrompt = processedTranscriptText.substring(
+        0,
+        MAX_TRANSCRIPT_LENGTH
+      );
+    }
+
+    // Construct a more detailed prompt
+    const prompt = `
+      **Analyze the following podcast transcript:**
+
+      **Metadata:**
+      - Title: ${metadata?.title || "N/A"}
+      - Channel: ${metadata?.channelName || "N/A"}
+      ${metadata?.duration ? `- Duration: ${metadata.duration}` : ""}
+
+      **Transcript:**
+      """
+      ${transcriptForPrompt}
+      """
+
+      **Instructions:**
+      Generate a comprehensive yet concise summary in Markdown format. Structure the summary with the following sections, ensuring each section has meaningful content derived *only* from the provided transcript and metadata. If a section cannot be populated from the text, omit it or state "Not applicable based on transcript."
+
+      1.  **Executive Summary:** (1-2 paragraphs capturing the core essence and main topics discussed).
+      2.  **Key Insights:** (3-5 distinct bullet points highlighting the most important takeaways, arguments, or findings).
+      3.  **Notable Quotes:** (2-3 impactful or representative quotes directly from the transcript, correctly attributed if possible, otherwise just list the quote).
+      4.  **Potential Action Items / Further Questions:** (1-3 actionable suggestions or thought-provoking questions raised by the content).
+
+      **Formatting Requirements:**
+      - Use standard Markdown (headers, bolding, lists).
+      - Ensure clarity, accuracy, and conciseness.
+      - Do NOT add any introductory or concluding phrases outside of the requested sections.
+      - Output only the Markdown content.
+    `;
+
+    console.log(
+      `[${videoId}] Sending request to OpenAI (gpt-4o-mini) for summarization...`
+    );
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 1200, // Increased slightly for potentially longer summaries
+      temperature: 0.5,
+    });
+    console.log(`[${videoId}] OpenAI summarization response received.`);
+
+    if (
+      !response.choices ||
+      response.choices.length === 0 ||
+      !response.choices[0].message?.content
+    ) {
+      // Log the API response if available and failed
+      console.error(
+        `[${videoId}] Invalid or empty response received from OpenAI. Response:`,
+        JSON.stringify(response, null, 2)
+      );
+      throw new Error("Invalid or empty response received from OpenAI.");
+    }
+
+    summary = response.choices[0].message.content.trim();
+  } catch (openaiError: any) {
+    console.error(
+      `[${videoId}] Error during OpenAI summarization: ${
+        openaiError.message || openaiError
+      }`
+    );
+    // Check for specific OpenAI errors (e.g., rate limits, content policy)
+    if (openaiError.response) {
+      // Check if it's an API error response
+      console.error(
+        `[${videoId}] OpenAI API Error Details: Status ${
+          openaiError.response.status
+        }, Data: ${JSON.stringify(openaiError.response.data)}`
+      );
+      summary = `Error generating summary due to OpenAI API issue (Status: ${openaiError.response.status}). Please try again later.`;
+    } else {
+      summary = "Error generating summary. Please try again later.";
+    }
+    // Keep the processed transcript text available even if summary fails
+  }
+
+  // Return successful response with metadata and summary
+  console.log(
+    `[${videoId}] Process completed successfully. Returning summary and transcript.`
+  );
+  return NextResponse.json({
+    metadata: metadata as PodcastMetadata, // Cast to full type
+    summary,
+    transcript: processedTranscriptText, // Return the full processed text
+    error: null, // Explicitly null on success
+  });
 }
 
 // Removed the old fetchPodcastMetadata internal fetch logic
