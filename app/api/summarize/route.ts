@@ -910,7 +910,16 @@ export async function POST(request: Request) {
     );
   }
 
-  const { videoId } = reqData;
+  // Support both direct videoId and url parameter
+  let videoId = reqData.videoId;
+
+  // If videoId is not provided but url is, try to extract videoId from url
+  if (!videoId && reqData.url) {
+    const match = reqData.url.match(
+      /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/))([^&?\s]+)/
+    );
+    videoId = match ? match[1] : null;
+  }
 
   if (!videoId) {
     return NextResponse.json(

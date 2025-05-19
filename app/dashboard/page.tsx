@@ -54,13 +54,14 @@ export default function Dashboard() {
     setSummary(null);
 
     try {
-      console.log("Submitting URL:", url);
+      const videoId = extractVideoId(url);
+      console.log("Submitting URL:", url, "Video ID:", videoId);
       const response = await fetch("/api/summarize", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ videoId }),
       });
 
       const data = await response.json();
@@ -149,7 +150,9 @@ export default function Dashboard() {
     // If switching to summary and no summary exists yet, generate it
     if (tab === "summary" && !summary && isUrlValidated) {
       setIsSummaryLoading(true);
-      handleSubmit(new Event("submit") as any);
+      // Create a proper event to avoid type errors
+      const fakeEvent = { preventDefault: () => {} } as React.FormEvent;
+      handleSubmit(fakeEvent);
     }
   };
 
