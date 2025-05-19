@@ -2,9 +2,10 @@ import { NextResponse } from "next/server";
 // Replace the youtube-transcript npm package with our custom implementation
 // import { YoutubeTranscript, TranscriptConfig } from "youtube-transcript";
 import { fetchTranscript, TranscriptLine } from "@/lib/youtube-transcript";
-import OpenAI from "openai";
+import { openai } from "@/lib/openai";
 import { fetchMetadataFromYouTubeAPI } from "@/lib/youtube";
 import { PodcastMetadata } from "@/components/PodcastMetadata";
+import { extractVideoId } from "@/lib/utils";
 
 // Check if OpenAI API key is set
 if (!process.env.OPENAI_API_KEY) {
@@ -897,265 +898,195 @@ async function fetchYouTubeTranscriptViaInnertubeAPI(videoId: string) {
   }
 }
 
-// Main POST handler (modified to handle metadata failure and try multiple transcript methods)
+/**
+ * Handles POST requests to summarize a YouTube video
+ */
 export async function POST(request: Request) {
-  // Extract the videoId from the request body
-  let reqData;
   try {
-    reqData = await request.json();
-  } catch (error) {
-    return NextResponse.json(
-      { error: "Invalid request body" },
-      { status: 400 }
-    );
-  }
-
-  // Support both direct videoId and url parameter
-  let videoId = reqData.videoId;
-
-  // If videoId is not provided but url is, try to extract videoId from url
-  if (!videoId && reqData.url) {
-    const match = reqData.url.match(
-      /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/))([^&?\s]+)/
-    );
-    videoId = match ? match[1] : null;
-  }
-
-  if (!videoId) {
-    return NextResponse.json(
-      { error: "Missing videoId parameter" },
-      { status: 400 }
-    );
-  }
-
-  console.log(`[${videoId}] Processing summarize request...`);
-
-  // Fetch YouTube metadata
-  console.log(`[${videoId}] Fetching video metadata...`);
-  let metadata = null;
-  let metadataError = null;
-  try {
-    metadata = await fetchMetadataFromYouTubeAPI(videoId);
-    console.log(`[${videoId}] Metadata successfully fetched.`);
-  } catch (error: any) {
-    console.error(
-      `[${videoId}] Error fetching metadata from YouTube API:`,
-      error.message || error
-    );
-    metadataError = error.message || "Unknown error fetching metadata";
-
-    // Try fallback via oEmbed
+    // Extract the videoId from the request body
+    let reqData;
     try {
-      metadata = await fetchOEmbedMetadataForSummarize(videoId);
-      if (metadata) {
-        console.log(
-          `[${videoId}] Partial metadata retrieved via oEmbed fallback.`
-        );
-        metadataError = null; // Clear error if fallback succeeded
-      }
-    } catch (fallbackError: any) {
-      console.error(
-        `[${videoId}] Fallback oEmbed metadata fetch also failed:`,
-        fallbackError.message || fallbackError
-      );
-    }
-  }
-
-  // --- Transcript Fetching Logic with Fallbacks ---
-  // Update the transcript fetching to use our custom implementation
-  let transcript: any = null; // Use 'any' or a specific transcript segment type
-  let lastTranscriptError: Error | null = null;
-
-  try {
-    // Try our custom implementation from the lib
-    console.log(
-      `[${videoId}] Attempting to fetch transcript with custom library...`
-    );
-    transcript = await fetchTranscript(videoId);
-    if (transcript && transcript.length > 0) {
-      console.log(
-        `[${videoId}] Successfully fetched transcript using custom implementation.`
-      );
-    } else {
-      console.warn(
-        `[${videoId}] Custom implementation returned empty transcript.`
-      );
-      throw new Error("No transcript content returned");
-    }
-  } catch (error: any) {
-    console.error(
-      `[${videoId}] Error fetching transcript:`,
-      error.message || error
-    );
-    lastTranscriptError = error;
-
-    // If this is a specific error about captions not being available,
-    // we'll handle it differently in the UI response
-    if (
-      error.message.includes("doesn't have captions") ||
-      error.message.includes("has disabled captions")
-    ) {
+      reqData = await request.json();
+    } catch (error) {
       return NextResponse.json(
-        {
-          error: "CAPTIONS_UNAVAILABLE",
-          message: error.message,
-          metadata: metadata || null,
-        },
-        { status: 404 }
+        { error: "Invalid request body" },
+        { status: 400 }
       );
     }
-  }
 
-  // If we still don't have a valid transcript, return an error
-  if (!transcript || transcript.length === 0) {
-    return NextResponse.json(
-      {
-        error: "TRANSCRIPT_FETCH_FAILED",
-        message: lastTranscriptError?.message || "Failed to fetch transcript",
-        metadata: metadata || null,
+    // Support both direct videoId and url parameter
+    let videoId = reqData.videoId;
+
+    // If videoId is not provided but url is, try to extract videoId from url
+    if (!videoId && reqData.url) {
+      try {
+        videoId = extractVideoId(reqData.url);
+        console.log(`Extracted videoId ${videoId} from URL ${reqData.url}`);
+      } catch (error) {
+        console.error(
+          `Failed to extract videoId from URL: ${reqData.url}`,
+          error
+        );
+        return NextResponse.json(
+          { error: "Could not extract videoId from provided URL" },
+          { status: 400 }
+        );
+      }
+    }
+
+    if (!videoId) {
+      console.error("Missing videoId parameter and no URL provided");
+      return NextResponse.json(
+        { error: "Missing videoId parameter" },
+        { status: 400 }
+      );
+    }
+
+    console.log(`Summarizing video with ID: ${videoId}`);
+
+    // Fetch video metadata and transcript in parallel
+    const [metadata, transcript] = await Promise.all([
+      fetchMetadataFromYouTubeAPI(videoId),
+      fetchTranscript(videoId),
+    ]);
+
+    // Check if we could get the metadata
+    if (!metadata) {
+      console.error(`Failed to fetch metadata for video ID: ${videoId}`);
+      return NextResponse.json(
+        { error: "Failed to fetch video metadata" },
+        { status: 500 }
+      );
+    }
+
+    // Check if we could get the transcript
+    if (!transcript || transcript.length === 0) {
+      console.error(`Failed to fetch transcript for video ID: ${videoId}`);
+      return NextResponse.json(
+        { error: "Failed to fetch video transcript" },
+        { status: 500 }
+      );
+    }
+
+    // Combine transcript text
+    const fullTranscript = transcript.map((line) => line.text).join(" ");
+
+    // Break into chunks of 12000 characters for OpenAI limit
+    const chunkSize = 12000;
+    const chunks = [];
+    for (let i = 0; i < fullTranscript.length; i += chunkSize) {
+      chunks.push(fullTranscript.slice(i, i + chunkSize));
+    }
+
+    // Process each chunk with OpenAI
+    const summaryPromises = chunks.map(async (chunk, i) => {
+      const prompt = `
+        You're summarizing part ${i + 1} of ${
+        chunks.length
+      } of a YouTube video transcript.
+        
+        Title: ${metadata.title}
+        Creator: ${metadata.channelName}
+        
+        Instructions:
+        1. Identify key points, ideas, and information.
+        2. Focus on the most valuable insights, skipping repetitive content.
+        3. Maintain the original meaning and tone.
+        4. Create a coherent, well-structured summary.
+        5. If this is part of a multi-part summary, focus on just this section.
+        
+        Transcript part ${i + 1}/${chunks.length}:
+        ${chunk}
+        
+        Summary of this part:`;
+
+      const response = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an expert at summarizing content. Create clear, concise summaries that retain the most valuable information.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        temperature: 0.5,
+        max_tokens: 500,
+      });
+
+      return response.choices[0]?.message?.content || "";
+    });
+
+    // Wait for all chunks to be processed
+    const chunkSummaries = await Promise.all(summaryPromises);
+
+    // If we have multiple chunks, create a final combined summary
+    let finalSummary = "";
+    if (chunks.length > 1) {
+      const combinedSummary = chunkSummaries.join("\n\n");
+      const finalPrompt = `
+        You're creating a final summary of a YouTube video based on summaries of multiple chunks of its transcript.
+        
+        Title: ${metadata.title}
+        Creator: ${metadata.channelName}
+        
+        Instructions:
+        1. Create a coherent, well-organized final summary from the separate chunk summaries.
+        2. Eliminate repetition across the chunks.
+        3. Identify the most important points from the entire video.
+        4. Structure the summary logically, possibly with sections if appropriate.
+        5. Keep the summary concise yet comprehensive.
+        
+        Individual chunk summaries:
+        ${combinedSummary}
+        
+        Final complete summary:`;
+
+      const finalResponse = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an expert at synthesizing summaries into a cohesive whole, maintaining the most important information while eliminating redundancy.",
+          },
+          {
+            role: "user",
+            content: finalPrompt,
+          },
+        ],
+        temperature: 0.5,
+        max_tokens: 1000,
+      });
+
+      finalSummary = finalResponse.choices[0]?.message?.content || "";
+    } else {
+      // If only one chunk, use that summary
+      finalSummary = chunkSummaries[0];
+    }
+
+    // Return the summary and metadata
+    return NextResponse.json({
+      summary: finalSummary,
+      metadata: {
+        title: metadata.title,
+        channelName: metadata.channelName,
+        thumbnails: metadata.thumbnails,
+        duration: metadata.duration,
+        viewCount: metadata.viewCount,
+        videoId: videoId,
       },
+    });
+  } catch (error: any) {
+    console.error("Error in summarize API:", error);
+    return NextResponse.json(
+      { error: error.message || "Failed to summarize video" },
       { status: 500 }
     );
   }
-
-  // ... rest of the code remains the same
-
-  // Replace this comment with the actual processing code:
-  // Process the transcript and generate a summary
-  console.log(
-    `[${videoId}] Transcript obtained (${transcript.length} segments), proceeding to format and summarize...`
-  );
-
-  // Join transcript segments into a single string
-  let processedTranscriptText = transcript
-    .map((item: { text: string }) => item.text)
-    .join(" ");
-
-  // Basic check for meaningful transcript content
-  let summary = "Could not generate summary."; // Default summary
-
-  if (processedTranscriptText.trim().length < 50) {
-    // Arbitrary short length check
-    console.warn(
-      `[${videoId}] Transcript text seems very short (${
-        processedTranscriptText.trim().length
-      } chars), summary might be poor.`
-    );
-    summary =
-      "Summary could not be generated (transcript content was too short or invalid).";
-    processedTranscriptText =
-      "Transcript content appears invalid or too short.";
-
-    return NextResponse.json(
-      {
-        metadata: metadata, // Return metadata
-        summary: summary,
-        transcript: processedTranscriptText,
-        error: "Transcript content invalid/short.",
-      },
-      { status: 200 }
-    );
-  }
-
-  // --- Summarization Logic ---
-  try {
-    const MAX_TRANSCRIPT_LENGTH = 100000; // gpt-4o-mini has large context, but keep reasonable limit
-    let transcriptForPrompt = processedTranscriptText;
-    if (processedTranscriptText.length > MAX_TRANSCRIPT_LENGTH) {
-      console.warn(
-        `[${videoId}] Transcript length (${processedTranscriptText.length}) exceeds limit (${MAX_TRANSCRIPT_LENGTH}), truncating.`
-      );
-      transcriptForPrompt = processedTranscriptText.substring(
-        0,
-        MAX_TRANSCRIPT_LENGTH
-      );
-    }
-
-    // Construct a more detailed prompt
-    const prompt = `
-      **Analyze the following podcast transcript:**
-
-      **Metadata:**
-      - Title: ${metadata?.title || "N/A"}
-      - Channel: ${metadata?.channelName || "N/A"}
-      ${metadata?.duration ? `- Duration: ${metadata.duration}` : ""}
-
-      **Transcript:**
-      """
-      ${transcriptForPrompt}
-      """
-
-      **Instructions:**
-      Generate a comprehensive yet concise summary in Markdown format. Structure the summary with the following sections, ensuring each section has meaningful content derived *only* from the provided transcript and metadata. If a section cannot be populated from the text, omit it or state "Not applicable based on transcript."
-
-      1.  **Executive Summary:** (1-2 paragraphs capturing the core essence and main topics discussed).
-      2.  **Key Insights:** (3-5 distinct bullet points highlighting the most important takeaways, arguments, or findings).
-      3.  **Notable Quotes:** (2-3 impactful or representative quotes directly from the transcript, correctly attributed if possible, otherwise just list the quote).
-      4.  **Potential Action Items / Further Questions:** (1-3 actionable suggestions or thought-provoking questions raised by the content).
-
-      **Formatting Requirements:**
-      - Use standard Markdown (headers, bolding, lists).
-      - Ensure clarity, accuracy, and conciseness.
-      - Do NOT add any introductory or concluding phrases outside of the requested sections.
-      - Output only the Markdown content.
-    `;
-
-    console.log(
-      `[${videoId}] Sending request to OpenAI (gpt-4o-mini) for summarization...`
-    );
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 1200, // Increased slightly for potentially longer summaries
-      temperature: 0.5,
-    });
-    console.log(`[${videoId}] OpenAI summarization response received.`);
-
-    if (
-      !response.choices ||
-      response.choices.length === 0 ||
-      !response.choices[0].message?.content
-    ) {
-      // Log the API response if available and failed
-      console.error(
-        `[${videoId}] Invalid or empty response received from OpenAI. Response:`,
-        JSON.stringify(response, null, 2)
-      );
-      throw new Error("Invalid or empty response received from OpenAI.");
-    }
-
-    summary = response.choices[0].message.content.trim();
-  } catch (openaiError: any) {
-    console.error(
-      `[${videoId}] Error during OpenAI summarization: ${
-        openaiError.message || openaiError
-      }`
-    );
-    // Check for specific OpenAI errors (e.g., rate limits, content policy)
-    if (openaiError.response) {
-      // Check if it's an API error response
-      console.error(
-        `[${videoId}] OpenAI API Error Details: Status ${
-          openaiError.response.status
-        }, Data: ${JSON.stringify(openaiError.response.data)}`
-      );
-      summary = `Error generating summary due to OpenAI API issue (Status: ${openaiError.response.status}). Please try again later.`;
-    } else {
-      summary = "Error generating summary. Please try again later.";
-    }
-    // Keep the processed transcript text available even if summary fails
-  }
-
-  // Return successful response with metadata and summary
-  console.log(
-    `[${videoId}] Process completed successfully. Returning summary and transcript.`
-  );
-  return NextResponse.json({
-    metadata: metadata as PodcastMetadata, // Cast to full type
-    summary,
-    transcript: processedTranscriptText, // Return the full processed text
-    error: null, // Explicitly null on success
-  });
 }
 
 // Removed the old fetchPodcastMetadata internal fetch logic

@@ -24,6 +24,11 @@ export async function fetchMetadataFromYouTubeAPI(
     const response = await fetch(url, {
       headers: {
         Accept: "application/json",
+        // Add a specific referer header that matches what's allowed in Google Cloud Console
+        // or use the app's own domain when deployed
+        Referer: "https://youtube-ai-podcast.vercel.app/",
+        // Add an origin header to match the referer
+        Origin: "https://youtube-ai-podcast.vercel.app",
       },
       next: { revalidate: 3600 }, // Cache for 1 hour
       signal: AbortSignal.timeout(10000), // 10 second timeout
@@ -38,6 +43,14 @@ export async function fetchMetadataFromYouTubeAPI(
       if (response.status === 401 || response.status === 403) {
         console.error(
           "Potential YouTube API Key issue (invalid, restricted, or quota exceeded)."
+        );
+        // Log more details for debugging
+        console.error(`Full error: ${errorData}`);
+        console.error(
+          `Request URL: ${url.replace(
+            YOUTUBE_API_KEY || "",
+            "[API_KEY_REDACTED]"
+          )}`
         );
       } else if (response.status === 404) {
         console.error(`Video with ID ${videoId} not found via YouTube API.`);

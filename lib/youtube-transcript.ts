@@ -367,10 +367,51 @@ async function extractAndParseTranscriptFromHtml(
 
             try {
               parsed = JSON.parse(matchedData);
-            } catch (e) {
+            } catch (e: any) {
+              if (pattern.source === "ytInitialDatas*=s*({.*?});") {
+                console.error(
+                  `[${videoId}] Failed to parse ytInitialData. Error: ${e.message}`
+                );
+                const errorPositionMatch = e.message.match(/position\s+(\d+)/);
+                if (errorPositionMatch && errorPositionMatch[1]) {
+                  const errorPos = parseInt(errorPositionMatch[1], 10);
+                  const contextChars = 100; // Number of characters before and after the error position
+                  const startIndex = Math.max(0, errorPos - contextChars);
+                  const endIndex = Math.min(
+                    matchedData.length,
+                    errorPos + contextChars
+                  );
+                  const errorContext = matchedData.substring(
+                    startIndex,
+                    endIndex
+                  );
+                  console.error(
+                    `[${videoId}] Raw data around error (pos ${errorPos}): ...${errorContext}...`
+                  );
+                  console.error(
+                    `[${videoId}] Total length of matchedData for ytInitialData: ${matchedData.length}`
+                  );
+                } else {
+                  console.error(
+                    `[${videoId}] Could not extract error position from message: ${e.message}`
+                  );
+                  console.error(
+                    `[${videoId}] Full matchedData for ytInitialData (first 500 chars): ${matchedData.substring(
+                      0,
+                      500
+                    )}`
+                  );
+                }
+                console.error(
+                  `[${videoId}] Stack trace for ytInitialData parsing error: ${e.stack}`
+                );
+              }
               // Try cleaning the string more aggressively if initial parse fails
               console.warn(
-                `[${videoId}] First parse attempt failed, trying with additional cleaning`
+                `[${videoId}] First parse attempt failed for pattern ${pattern.source.substring(
+                  0,
+                  50
+                )}, trying with additional cleaning`
               );
               matchedData = matchedData
                 .replace(/\n/g, "")
