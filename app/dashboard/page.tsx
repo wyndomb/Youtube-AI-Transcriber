@@ -54,7 +54,6 @@ export default function Dashboard() {
     setSummary(null);
 
     try {
-      const videoId = extractVideoId(url);
       console.log("Submitting URL:", url, "Video ID:", videoId);
       const response = await fetch("/api/summarize", {
         method: "POST",
@@ -110,7 +109,7 @@ export default function Dashboard() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          url,
+          videoId,
           question:
             "Just checking if the transcript exists. Please respond with 'Yes'.",
         }),

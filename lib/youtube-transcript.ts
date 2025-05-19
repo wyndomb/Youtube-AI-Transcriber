@@ -28,37 +28,97 @@ function parseTimestamp(timestamp: string): number {
 const getBrowserLikeHeaders = () => {
   return {
     "User-Agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
     Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Sec-Fetch-Site": "same-origin",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-User": "?1",
     "Sec-Fetch-Dest": "document",
     "sec-ch-ua":
-      '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+      '"Chromium";v="123", "Google Chrome";v="123", "Not:A-Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
+    "sec-ch-ua-platform": '"Windows"',
     "Upgrade-Insecure-Requests": "1",
     Referer: "https://www.youtube.com/",
     "Cache-Control": "max-age=0",
+    // Additional headers to help bypass proxy detection
+    "X-Forwarded-For": "66.249.66.1", // Simulating a Google crawler IP
+    "X-Forwarded-Host": "www.youtube.com",
+    DNT: "1", // Do Not Track
+    Connection: "keep-alive",
   };
 };
 
 // Storage for cookies and session data between requests
 let cookieJar = "";
 let consentToken = "";
+// Track last request time to avoid rate limiting
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 500; // Minimum 500ms between requests
+
+// Simple cookie parser
+const parseCookies = (cookieHeader: string | null): Record<string, string> => {
+  const cookies: Record<string, string> = {};
+  if (!cookieHeader) return cookies;
+
+  cookieHeader.split(";").forEach((cookie) => {
+    const parts = cookie.split("=");
+    if (parts.length >= 2) {
+      const name = parts[0].trim();
+      const value = parts.slice(1).join("=").trim();
+      cookies[name] = value;
+    }
+  });
+  return cookies;
+};
+
+// Merge cookies to maintain session
+const mergeCookies = (
+  existingCookies: string,
+  newCookieHeader: string | null
+): string => {
+  if (!newCookieHeader) return existingCookies;
+
+  const existing = parseCookies(existingCookies);
+  const newCookies = parseCookies(newCookieHeader);
+
+  // Merge cookies, new ones override existing
+  const merged = { ...existing, ...newCookies };
+
+  // Convert back to cookie string
+  return Object.entries(merged)
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
+};
 
 // Simple cache for HTML content by videoId
 const htmlCache: Record<string, { html: string; timestamp: number }> = {};
 const CACHE_TTL = 60 * 1000; // 1 minute cache
+
+// Add rate limiting protection
+const waitBetweenRequests = async (): Promise<void> => {
+  const now = Date.now();
+  const elapsed = now - lastRequestTime;
+
+  if (elapsed < MIN_REQUEST_INTERVAL) {
+    // Add some randomness to make the delay less predictable (450-550ms)
+    const delay = MIN_REQUEST_INTERVAL - elapsed + (Math.random() * 100 - 50);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+
+  lastRequestTime = Date.now();
+};
 
 // Helper function to establish YouTube session and get initial cookies
 async function establishYouTubeSession(): Promise<boolean> {
   try {
     // Reset cookie jar for a fresh session
     cookieJar = "";
+
+    // Wait to avoid rate limiting
+    await waitBetweenRequests();
 
     // Initial touch to get YouTube cookies and possibly consent page
     const initialResponse = await fetch("https://www.youtube.com/", {
@@ -92,6 +152,9 @@ async function establishYouTubeSession(): Promise<boolean> {
 // Helper function to handle YouTube consent pages
 async function processConsentPage(consentUrl: string): Promise<void> {
   try {
+    // Wait to avoid rate limiting
+    await waitBetweenRequests();
+
     // First fetch the consent page
     const consentPageResponse = await fetch(consentUrl, {
       headers: {
@@ -104,7 +167,7 @@ async function processConsentPage(consentUrl: string): Promise<void> {
     // Update cookies
     const consentCookies = consentPageResponse.headers.get("set-cookie");
     if (consentCookies) {
-      cookieJar = consentCookies;
+      cookieJar = mergeCookies(cookieJar, consentCookies);
     }
 
     // Parse the consent page
@@ -137,6 +200,9 @@ async function processConsentPage(consentUrl: string): Promise<void> {
       formData.append("consent_hl", "en");
       formData.append("consent_gac", "1");
 
+      // Wait to avoid rate limiting
+      await waitBetweenRequests();
+
       // Submit the consent form
       const submitResponse = await fetch(formAction || consentUrl, {
         method: "POST",
@@ -152,7 +218,7 @@ async function processConsentPage(consentUrl: string): Promise<void> {
       // Update cookies once more
       const submitCookies = submitResponse.headers.get("set-cookie");
       if (submitCookies) {
-        cookieJar = submitCookies;
+        cookieJar = mergeCookies(cookieJar, submitCookies);
         console.log("Processed YouTube consent page successfully");
       }
     }
@@ -168,65 +234,302 @@ async function extractAndParseTranscriptFromHtml(
 ): Promise<TranscriptLine[] | null> {
   console.log(`[${videoId}] Extracting transcript data from HTML...`);
   let rawCaptionsData = null;
+
+  // More comprehensive patterns to extract captions data
   const patterns = [
+    // Standard pattern for captions object
     /"captions":\s*(\{.*?"captionTracks":.*?\}),\s*"videoDetails"/,
+
+    // Alternative pattern for direct captionTracks array
     /"captionTracks":\s*(\[.*?\])/,
-    /"baseUrl":"(https:\/\/www\.youtube\.com\/api\/timedtext.*?)"/,
+
+    // Direct baseUrl extraction pattern
+    /"baseUrl":"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/,
+
+    // Newer YouTube format with embedded JSON
+    /\{"captionTracks":(\[.*?\]),"audioTracks"/,
+
+    // Patterns for various JSON structures
+    /"playerCaptionsTracklistRenderer"\s*:\s*(\{.*?\})/,
+
+    // Special pattern for timedtext in video_id format
+    new RegExp(`\\/api\\/timedtext\\?.*?v=${videoId}[^"]+`, "g"),
+
+    // Try to find playerResponse JSON object which contains captions
+    /ytInitialPlayerResponse\s*=\s*(\{.*?\});/,
+
+    // New pattern for finding playerResponse in newer YouTube structure
+    /"playerResponse":"(\{.*?\})"/,
+
+    // Additional pattern for player_response in legacy structure
+    /"player_response":"(.*?)"/,
+
+    // Pattern for initial data in newer YouTube
+    /ytInitialData\s*=\s*(\{.*?\});/,
+
+    // Pattern for finding caption tracks in ytcfg data
+    /"CAPTION_TRACKS_RESPONSE":"(.*?)"/,
   ];
 
-  for (const pattern of patterns) {
-    const match = html.match(pattern);
-    if (match && match[1]) {
-      const matchedData = match[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-      console.log(
-        `[${videoId}] Found potential captions data using pattern: ${pattern.source.substring(
-          0,
-          30
-        )}...`
+  // First try to extract from ytInitialPlayerResponse which is more reliable
+  const playerResponseMatch = html.match(
+    /ytInitialPlayerResponse\s*=\s*(\{.*?\});/
+  );
+
+  if (playerResponseMatch && playerResponseMatch[1]) {
+    try {
+      const playerResponse = JSON.parse(playerResponseMatch[1]);
+      // Check if captions exist in the player response
+      if (
+        playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+      ) {
+        console.log(`[${videoId}] Found captions in ytInitialPlayerResponse`);
+        rawCaptionsData = JSON.stringify(playerResponse.captions);
+      }
+    } catch (e) {
+      console.warn(
+        `[${videoId}] Failed to parse ytInitialPlayerResponse: ${e}`
       );
-      if (pattern.source.includes("baseUrl")) {
-        const decodedUrl = decodeURIComponent(JSON.parse(`"${matchedData}"`));
+    }
+  }
+
+  // If we couldn't get data from ytInitialPlayerResponse, try other patterns
+  if (!rawCaptionsData) {
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match && match[1]) {
+        let matchedData = match[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+
+        // Handle URL encoded JSON (common in player_response)
+        if (
+          pattern.source.includes("player_response") ||
+          pattern.source.includes("CAPTION_TRACKS_RESPONSE")
+        ) {
+          try {
+            matchedData = decodeURIComponent(matchedData);
+          } catch (e) {
+            console.warn(`[${videoId}] Failed to decode URI component: ${e}`);
+          }
+        }
+
+        console.log(
+          `[${videoId}] Found potential captions data using pattern: ${pattern.source.substring(
+            0,
+            30
+          )}...`
+        );
+
+        if (
+          pattern.source.includes("baseUrl") ||
+          pattern.source.includes("timedtext")
+        ) {
+          // Handle direct URL pattern
+          try {
+            // If it's already a URL, use it directly; otherwise, decode it
+            let decodedUrl = matchedData;
+            if (matchedData.includes('\\"')) {
+              decodedUrl = decodeURIComponent(JSON.parse(`"${matchedData}"`)); // Safer decoding
+            }
+
+            // If the URL is relative, make it absolute
+            if (decodedUrl.startsWith("/api/timedtext")) {
+              decodedUrl = `https://www.youtube.com${decodedUrl}`;
+            }
+
+            rawCaptionsData = JSON.stringify({
+              playerCaptionsTracklistRenderer: {
+                captionTracks: [{ baseUrl: decodedUrl }],
+              },
+            });
+            console.log(
+              `[${videoId}] Extracted direct transcript URL: ${decodedUrl.substring(
+                0,
+                60
+              )}...`
+            );
+          } catch (e) {
+            console.warn(`[${videoId}] Failed to decode URL: ${e}`);
+          }
+        } else {
+          // Attempt to parse as JSON for other patterns
+          try {
+            // Enhanced JSON parsing with better error handling
+            let parsed;
+
+            // Handle escaped JSON strings
+            if (matchedData.startsWith('"') && matchedData.endsWith('"')) {
+              try {
+                matchedData = JSON.parse(matchedData);
+              } catch (e) {
+                console.warn(`[${videoId}] Failed to parse JSON string: ${e}`);
+              }
+            }
+
+            try {
+              parsed = JSON.parse(matchedData);
+            } catch (e) {
+              // Try cleaning the string more aggressively if initial parse fails
+              console.warn(
+                `[${videoId}] First parse attempt failed, trying with additional cleaning`
+              );
+              matchedData = matchedData
+                .replace(/\n/g, "")
+                .replace(/\r/g, "")
+                .replace(/\t/g, "")
+                .replace(/\\x(\d\d)/g, (_, p1) =>
+                  String.fromCharCode(parseInt(p1, 16))
+                );
+
+              // Try replacing escaped backslashes and quotes more thoroughly
+              matchedData = matchedData
+                .replace(/\\\\"/g, '"')
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, "\\");
+
+              try {
+                parsed = JSON.parse(matchedData);
+              } catch (e2) {
+                console.warn(
+                  `[${videoId}] Second parse attempt also failed: ${e2}`
+                );
+                // One more attempt with even more aggressive cleaning
+                try {
+                  matchedData = matchedData
+                    .replace(/[\\]+"/g, '"')
+                    .replace(/[\\]+/g, "\\");
+                  parsed = JSON.parse(matchedData);
+                } catch (e3) {
+                  console.warn(
+                    `[${videoId}] Third parse attempt failed: ${e3}`
+                  );
+                  throw e; // Throw the original error
+                }
+              }
+            }
+
+            // Process the parsed data based on its structure
+            if (parsed) {
+              if (parsed.captionTracks) {
+                rawCaptionsData = JSON.stringify({
+                  playerCaptionsTracklistRenderer: {
+                    captionTracks: parsed.captionTracks,
+                  },
+                });
+              } else if (
+                parsed.playerCaptionsTracklistRenderer &&
+                parsed.playerCaptionsTracklistRenderer.captionTracks
+              ) {
+                rawCaptionsData = JSON.stringify(parsed);
+              } else if (
+                parsed.captions &&
+                parsed.captions.playerCaptionsTracklistRenderer
+              ) {
+                rawCaptionsData = JSON.stringify(parsed.captions);
+              } else {
+                // Advanced search through the object
+                const findCaptionTracks = (obj: any) => {
+                  if (!obj || typeof obj !== "object") return null;
+
+                  // Direct match for captionTracks array
+                  if (
+                    Array.isArray(obj.captionTracks) &&
+                    obj.captionTracks.length > 0
+                  ) {
+                    return {
+                      playerCaptionsTracklistRenderer: {
+                        captionTracks: obj.captionTracks,
+                      },
+                    };
+                  }
+
+                  // Match for common playerCaptionsTracklistRenderer pattern
+                  if (obj.playerCaptionsTracklistRenderer?.captionTracks) {
+                    return {
+                      playerCaptionsTracklistRenderer:
+                        obj.playerCaptionsTracklistRenderer,
+                    };
+                  }
+
+                  // Look for captions object
+                  if (
+                    obj.captions?.playerCaptionsTracklistRenderer?.captionTracks
+                  ) {
+                    return obj.captions;
+                  }
+
+                  // Recursively search keys that are objects or arrays
+                  for (const key in obj) {
+                    if (obj[key] && typeof obj[key] === "object") {
+                      const result = findCaptionTracks(obj[key]);
+                      if (result) return result;
+                    }
+                  }
+
+                  return null;
+                };
+
+                const captionsObject = findCaptionTracks(parsed);
+                if (captionsObject) {
+                  rawCaptionsData = JSON.stringify(captionsObject);
+                  console.log(
+                    `[${videoId}] Found caption tracks through deep object search`
+                  );
+                }
+              }
+
+              if (rawCaptionsData) {
+                console.log(`[${videoId}] Successfully parsed extracted JSON.`);
+              } else {
+                console.warn(
+                  `[${videoId}] Parsed JSON has unexpected structure.`
+                );
+                // Dump first 200 chars of structure for debugging
+                console.warn(
+                  `[${videoId}] Structure: ${JSON.stringify(parsed).substring(
+                    0,
+                    200
+                  )}`
+                );
+              }
+            }
+          } catch (parseError) {
+            console.warn(
+              `[${videoId}] Failed to parse extracted data for pattern ${pattern.source.substring(
+                0,
+                30
+              )}...: ${parseError}`
+            );
+          }
+        }
+        if (rawCaptionsData) break; // Stop if valid data found
+      }
+    }
+  }
+
+  // Last resort: try to find any timedtext URL in the HTML
+  if (!rawCaptionsData) {
+    const timedTextMatch = html.match(
+      /https:\/\/www\.youtube\.com\/api\/timedtext[^"]+/
+    );
+    if (timedTextMatch) {
+      try {
+        const timedTextUrl = timedTextMatch[0].replace(/\\u0026/g, "&");
+        console.log(
+          `[${videoId}] Found fallback timedtext URL: ${timedTextUrl.substring(
+            0,
+            60
+          )}...`
+        );
         rawCaptionsData = JSON.stringify({
           playerCaptionsTracklistRenderer: {
-            captionTracks: [{ baseUrl: decodedUrl }],
+            captionTracks: [{ baseUrl: timedTextUrl }],
           },
         });
-        console.log(`[${videoId}] Extracted direct transcript URL.`);
-      } else {
-        try {
-          const parsed = JSON.parse(matchedData);
-          if (
-            parsed &&
-            (parsed.captionTracks ||
-              (parsed.playerCaptionsTracklistRenderer &&
-                parsed.playerCaptionsTracklistRenderer.captionTracks))
-          ) {
-            if (
-              parsed.captionTracks &&
-              !parsed.playerCaptionsTracklistRenderer
-            ) {
-              rawCaptionsData = JSON.stringify({
-                playerCaptionsTracklistRenderer: {
-                  captionTracks: parsed.captionTracks,
-                },
-              });
-            } else {
-              rawCaptionsData = JSON.stringify(parsed);
-            }
-            console.log(`[${videoId}] Successfully parsed extracted JSON.`);
-          } else {
-            console.warn(`[${videoId}] Parsed JSON has unexpected structure.`);
-          }
-        } catch (parseError) {
-          console.warn(
-            `[${videoId}] Failed to parse extracted data for pattern ${pattern.source.substring(
-              0,
-              30
-            )}...: ${parseError}`
-          );
-        }
+      } catch (e) {
+        console.warn(
+          `[${videoId}] Failed to process fallback timedtext URL: ${e}`
+        );
       }
-      if (rawCaptionsData) break;
     }
   }
 
@@ -234,12 +537,14 @@ async function extractAndParseTranscriptFromHtml(
     console.error(
       `[${videoId}] No captions data found in video page using any pattern.`
     );
+    // Log a snippet of the HTML for debugging
+    console.error(`[${videoId}] HTML snippet: ${html.substring(0, 500)}...`);
     return null;
   }
 
   let captionsData;
   try {
-    captionsData = JSON.parse(rawCaptionsData);
+    captionsData = JSON.parse(rawCaptionsData); // Already cleaned during extraction
   } catch (e: any) {
     console.error(
       `[${videoId}] Failed to parse final captions JSON: ${
@@ -249,44 +554,68 @@ async function extractAndParseTranscriptFromHtml(
     throw new Error(`Failed to parse final captions data: ${e.message}`);
   }
 
-  if (
-    !captionsData?.playerCaptionsTracklistRenderer?.captionTracks ||
-    captionsData.playerCaptionsTracklistRenderer.captionTracks.length === 0
-  ) {
+  // More robust extraction of caption tracks
+  let captionTracks = null;
+
+  // Check multiple possible structures
+  if (captionsData?.playerCaptionsTracklistRenderer?.captionTracks) {
+    captionTracks = captionsData.playerCaptionsTracklistRenderer.captionTracks;
+  } else if (captionsData?.captionTracks) {
+    captionTracks = captionsData.captionTracks;
+  }
+
+  if (!captionTracks || captionTracks.length === 0) {
     console.warn(
       `[${videoId}] Parsed captions data lacks track information or is empty.`
     );
-    return null;
+    throw new Error("Transcript tracks unavailable or disabled in parsed data");
   }
 
+  // Find the first usable transcript URL (prefer 'en' if available, otherwise take first)
   let transcriptUrl = "";
-  const tracks = captionsData.playerCaptionsTracklistRenderer.captionTracks;
-  const englishTrack = tracks.find((track: any) => track.languageCode === "en");
-  transcriptUrl = englishTrack?.baseUrl || tracks[0]?.baseUrl;
+  const englishTrack = captionTracks.find(
+    (track: any) => track.languageCode === "en"
+  );
+  transcriptUrl = englishTrack?.baseUrl || captionTracks[0]?.baseUrl;
 
   if (!transcriptUrl) {
     console.error(
       `[${videoId}] Could not find a valid baseUrl in caption tracks.`
     );
-    return null;
+    throw new Error("No valid transcript URL found in caption tracks");
   }
+
+  // Add necessary URL parameters if they're missing
+  if (!transcriptUrl.includes("lang=")) {
+    transcriptUrl += transcriptUrl.includes("?") ? "&lang=en" : "?lang=en";
+  }
+  if (!transcriptUrl.includes("fmt=")) {
+    transcriptUrl += "&fmt=srv3"; // Request a modern format
+  }
+
   console.log(
     `[${videoId}] Using transcript URL: ${transcriptUrl.substring(0, 60)}...`
   );
 
-  // Fetch the transcript XML/TTML
-  const transcriptResponse = await fetch(transcriptUrl, {
-    headers: {
-      ...getBrowserLikeHeaders(),
-      ...(cookieJar ? { Cookie: cookieJar } : {}),
-    },
-    signal: AbortSignal.timeout(10000),
-  });
+  // Wait to avoid rate limiting
+  await waitBetweenRequests();
 
-  // Save cookies for future requests
-  const setCookieHeader = transcriptResponse.headers.get("set-cookie");
-  if (setCookieHeader) {
-    cookieJar = setCookieHeader;
+  // Fetch the transcript XML/TTML with enhanced error handling
+  let transcriptResponse;
+  try {
+    console.log(`[${videoId}] Fetching transcript content...`);
+    transcriptResponse = await fetch(transcriptUrl, {
+      headers: getBrowserLikeHeaders(),
+      signal: AbortSignal.timeout(10000), // 10 second timeout
+    });
+  } catch (fetchError: any) {
+    console.error(
+      `[${videoId}] Failed to fetch transcript content: ${fetchError.message}`
+    );
+    if (fetchError.name === "AbortError") {
+      throw new Error("Transcript fetch timed out - try again later");
+    }
+    throw new Error(`Failed to fetch transcript: ${fetchError.message}`);
   }
 
   if (!transcriptResponse.ok) {
@@ -305,41 +634,59 @@ async function extractAndParseTranscriptFromHtml(
   }
 
   const transcriptContent = await transcriptResponse.text();
+
+  // Enhanced validation of transcript content
   if (!transcriptContent || transcriptContent.length < 50) {
     console.error(`[${videoId}] Invalid or empty transcript content received.`);
-    return null;
+    throw new Error("Invalid or empty transcript data received");
   }
-  if (
-    !transcriptContent.includes("<text") &&
-    !transcriptContent.includes("<p")
-  ) {
+
+  // Enhanced content type detection
+  const contentType = transcriptResponse.headers.get("content-type");
+  console.log(`[${videoId}] Transcript content type: ${contentType}`);
+
+  // More robust check: look for common transcript tags
+  const hasTextTags = transcriptContent.includes("<text");
+  const hasPTags = transcriptContent.includes("<p");
+
+  if (!hasTextTags && !hasPTags) {
     console.warn(
       `[${videoId}] Transcript content might be invalid (missing common tags): ${transcriptContent.substring(
         0,
         200
       )}...`
     );
+    // Don't throw immediately, still try to parse
   }
 
   // Parse the XML/TTML to extract transcript segments
-  const transcript: TranscriptLine[] = [];
-  const xmlRegex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
-  const ttmlRegex = /<p begin="([^"]*)" end="([^"]*)"[^>]*>([^<]*)<\/p>/g;
-  let match;
+  const transcript = [];
 
+  // Handle standard XML format <text start="..." dur="...">...</text>
+  const xmlRegex = /<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>/g;
+
+  // Handle alternative format (often in TTML) <p begin="..." end="..." ...>...</p>
+  const ttmlRegex = /<p begin="([^"]*)" end="([^"]*)"[^>]*>([^<]*)<\/p>/g;
+
+  // Handle another TTML variant
+  const ttmlRegex2 = /<p t="([^"]*)" d="([^"]*)"[^>]*>([^<]*)<\/p>/g;
+
+  // Handle yet another YouTube variant
+  const ttmlRegex3 =
+    /<p id="[^"]*" begin="([^"]*)" end="([^"]*)"[^>]*>([^<]*)<\/p>/g;
+
+  let match;
+  let foundSegments = false;
+
+  // Try XML first
   while ((match = xmlRegex.exec(transcriptContent)) !== null) {
+    foundSegments = true;
     const offset = parseFloat(match[1]);
     const duration = parseFloat(match[2]);
+    // Basic sanity check for parsed numbers
     if (!isNaN(offset) && !isNaN(duration)) {
       transcript.push({
-        text: match[3]
-          .replace(/&amp;/g, "&")
-          .replace(/&lt;/g, "<")
-          .replace(/&gt;/g, ">")
-          .replace(/&#39;/g, "'")
-          .replace(/&quot;/g, '"')
-          .replace(/\\n/g, " ")
-          .trim(),
+        text: decodeAndCleanText(match[3]),
         duration: duration,
         offset: offset,
       });
@@ -350,24 +697,20 @@ async function extractAndParseTranscriptFromHtml(
     }
   }
 
+  // If XML parsing yielded nothing, try TTML format
   if (transcript.length === 0) {
     console.log(
       `[${videoId}] XML pattern found no segments, trying TTML pattern...`
     );
     while ((match = ttmlRegex.exec(transcriptContent)) !== null) {
-      const offset = parseTimestamp(match[1]);
+      foundSegments = true;
+      const offset = parseTimestamp(match[1]); // Need helper to parse HH:MM:SS.ms
       const end = parseTimestamp(match[2]);
       const duration = end - offset;
+      // Basic sanity check for parsed numbers
       if (!isNaN(offset) && !isNaN(duration) && duration >= 0) {
         transcript.push({
-          text: match[3]
-            .replace(/&amp;/g, "&")
-            .replace(/&lt;/g, "<")
-            .replace(/&gt;/g, ">")
-            .replace(/&#39;/g, "'")
-            .replace(/&quot;/g, '"')
-            .replace(/\\n/g, " ")
-            .trim(),
+          text: decodeAndCleanText(match[3]),
           duration: duration,
           offset: offset,
         });
@@ -379,20 +722,91 @@ async function extractAndParseTranscriptFromHtml(
     }
   }
 
+  // Try the second TTML variant if still no results
   if (transcript.length === 0) {
-    console.error(
-      `[${videoId}] Failed to parse transcript content using both XML and TTML patterns. Content snippet: ${transcriptContent.substring(
-        0,
-        500
-      )}...`
+    console.log(
+      `[${videoId}] TTML pattern found no segments, trying alternative TTML pattern...`
     );
-    return null;
+    while ((match = ttmlRegex2.exec(transcriptContent)) !== null) {
+      foundSegments = true;
+      const offset = parseFloat(match[1]) / 1000; // Convert ms to seconds
+      const duration = parseFloat(match[2]) / 1000; // Convert ms to seconds
+
+      if (!isNaN(offset) && !isNaN(duration) && duration >= 0) {
+        transcript.push({
+          text: decodeAndCleanText(match[3]),
+          duration: duration,
+          offset: offset,
+        });
+      } else {
+        console.warn(
+          `[${videoId}] Skipping segment due to invalid number format (TTML2): t='${match[1]}', d='${match[2]}'`
+        );
+      }
+    }
+  }
+
+  // Try the third TTML variant if still no results
+  if (transcript.length === 0) {
+    console.log(
+      `[${videoId}] Alternative TTML pattern found no segments, trying third TTML pattern...`
+    );
+    while ((match = ttmlRegex3.exec(transcriptContent)) !== null) {
+      foundSegments = true;
+      const offset = parseTimestamp(match[1]);
+      const end = parseTimestamp(match[2]);
+      const duration = end - offset;
+
+      if (!isNaN(offset) && !isNaN(duration) && duration >= 0) {
+        transcript.push({
+          text: decodeAndCleanText(match[3]),
+          duration: duration,
+          offset: offset,
+        });
+      } else {
+        console.warn(
+          `[${videoId}] Skipping segment due to invalid number format (TTML3): begin='${match[1]}', end='${match[2]}'`
+        );
+      }
+    }
+  }
+
+  if (transcript.length === 0) {
+    if (foundSegments) {
+      console.error(
+        `[${videoId}] Found transcript segments but failed to parse them properly. Content sample: ${transcriptContent.substring(
+          0,
+          500
+        )}...`
+      );
+    } else {
+      console.error(
+        `[${videoId}] Failed to parse transcript content - no segments found. Content sample: ${transcriptContent.substring(
+          0,
+          500
+        )}...`
+      );
+    }
+    throw new Error("Failed to parse transcript XML/TTML content");
   }
 
   console.log(
-    `[${videoId}] Successfully extracted and parsed transcript from HTML: ${transcript.length} segments`
+    `[${videoId}] Successfully fetched and parsed transcript: ${transcript.length} segments`
   );
   return transcript;
+}
+
+// Helper function to decode and clean text from XML/HTML
+function decodeAndCleanText(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/\\n/g, " ")
+    .replace(/\s+/g, " ") // Normalize whitespace
+    .trim();
 }
 
 // Extracts caption data from HTML, finds URL, fetches, and parses transcript
@@ -428,6 +842,7 @@ async function fetchTranscriptDirect(
     }
 
     // Random delay to mimic human behavior (100-300ms)
+    await waitBetweenRequests();
     await new Promise((resolve) =>
       setTimeout(resolve, 100 + Math.random() * 200)
     );
@@ -468,6 +883,7 @@ async function fetchTranscriptDirect(
       console.log(
         `[${videoId}] Retrying main request after processing consent...`
       );
+      await waitBetweenRequests();
       const retryResponse = await fetch(
         `https://www.youtube.com/watch?v=${videoId}`,
         {
@@ -487,7 +903,7 @@ async function fetchTranscriptDirect(
       // Update cookies from the retry response
       const retryCookies = retryResponse.headers.get("set-cookie");
       if (retryCookies) {
-        cookieJar = retryCookies;
+        cookieJar = mergeCookies(cookieJar, retryCookies);
       }
 
       // Continue with this response
@@ -521,7 +937,7 @@ async function fetchTranscriptDirect(
     // Update cookies from the video page response
     const videoPageCookies = response.headers.get("set-cookie");
     if (videoPageCookies) {
-      cookieJar = videoPageCookies;
+      cookieJar = mergeCookies(cookieJar, videoPageCookies);
     }
 
     if (!response.ok) {
@@ -596,6 +1012,9 @@ async function fetchTranscriptInnertube(
   console.log(`[${videoId}] Attempting Innertube API Strategy...`);
 
   try {
+    // Wait to avoid rate limiting
+    await waitBetweenRequests();
+
     // 1. Fetch Initial Page Content with enhanced headers
     const initialResponse = await fetch(
       `https://www.youtube.com/watch?v=${videoId}`,
@@ -611,7 +1030,7 @@ async function fetchTranscriptInnertube(
     // Update cookies from this response
     const setCookieHeader = initialResponse.headers.get("set-cookie");
     if (setCookieHeader) {
-      cookieJar = setCookieHeader;
+      cookieJar = mergeCookies(cookieJar, setCookieHeader);
     }
 
     if (!initialResponse.ok) {
@@ -655,6 +1074,9 @@ async function fetchTranscriptInnertube(
       )}..., Version: ${INNERTUBE_CONTEXT.client.clientVersion}`
     );
 
+    // Wait to avoid rate limiting
+    await waitBetweenRequests();
+
     // 3. Make the Innertube API request with enhanced headers
     const playerApiUrl = `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}`;
     const playerApiResponse = await fetch(playerApiUrl, {
@@ -678,7 +1100,7 @@ async function fetchTranscriptInnertube(
     // Update cookies from this API response
     const apiCookies = playerApiResponse.headers.get("set-cookie");
     if (apiCookies) {
-      cookieJar = apiCookies;
+      cookieJar = mergeCookies(cookieJar, apiCookies);
     }
 
     if (!playerApiResponse.ok) {
@@ -743,6 +1165,9 @@ async function fetchTranscriptInnertube(
       )}...`
     );
 
+    // Wait to avoid rate limiting
+    await waitBetweenRequests();
+
     // 6. Fetch the transcript with enhanced headers
     const transcriptResponse = await fetch(transcriptUrl, {
       headers: {
@@ -755,7 +1180,7 @@ async function fetchTranscriptInnertube(
     // Update cookies again
     const transcriptCookies = transcriptResponse.headers.get("set-cookie");
     if (transcriptCookies) {
-      cookieJar = transcriptCookies;
+      cookieJar = mergeCookies(cookieJar, transcriptCookies);
     }
 
     if (!transcriptResponse.ok) {
@@ -803,14 +1228,7 @@ async function fetchTranscriptInnertube(
       const duration = parseFloat(match[2]);
       if (!isNaN(offset) && !isNaN(duration)) {
         transcript.push({
-          text: match[3]
-            .replace(/&amp;/g, "&")
-            .replace(/&lt;/g, "<")
-            .replace(/&gt;/g, ">")
-            .replace(/&#39;/g, "'")
-            .replace(/&quot;/g, '"')
-            .replace(/\\n/g, " ")
-            .trim(),
+          text: decodeAndCleanText(match[3]),
           duration: duration,
           offset: offset,
         });
@@ -827,14 +1245,7 @@ async function fetchTranscriptInnertube(
         const duration = end - offset;
         if (!isNaN(offset) && !isNaN(duration) && duration >= 0) {
           transcript.push({
-            text: match[3]
-              .replace(/&amp;/g, "&")
-              .replace(/&lt;/g, "<")
-              .replace(/&gt;/g, ">")
-              .replace(/&#39;/g, "'")
-              .replace(/&quot;/g, '"')
-              .replace(/\\n/g, " ")
-              .trim(),
+            text: decodeAndCleanText(match[3]),
             duration: duration,
             offset: offset,
           });
@@ -865,6 +1276,9 @@ async function fetchTranscriptInnertube(
       );
       // Need to ensure html was fetched if error occurred early
       try {
+        // Wait to avoid rate limiting
+        await waitBetweenRequests();
+
         const initialResponse = await fetch(
           `https://www.youtube.com/watch?v=${videoId}`,
           {

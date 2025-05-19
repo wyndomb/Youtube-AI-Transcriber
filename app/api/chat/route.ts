@@ -21,15 +21,39 @@ export async function POST(request: Request) {
   try {
     // Parse request body
     const body = await request.json();
-    const { url, question, chatHistory = [] } = body;
+    const { url, videoId: providedVideoId, question, chatHistory = [] } = body;
 
-    console.log("Processing chat for URL:", url);
-    console.log("Question:", question);
+    // Support both direct videoId and url parameter
+    let videoId = providedVideoId;
 
-    if (!url) {
-      console.error("No URL provided");
-      return NextResponse.json({ error: "No URL provided" }, { status: 400 });
+    // If videoId is not provided but url is, try to extract videoId from url
+    if (!videoId && url) {
+      console.log("Processing chat for URL:", url);
+      videoId = url.match(
+        /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/))([^&?\s]+)/
+      )?.[1];
+
+      if (!videoId) {
+        console.error("Invalid YouTube URL:", url);
+        return NextResponse.json(
+          { error: "Invalid YouTube URL" },
+          { status: 400 }
+        );
+      }
+      console.log("Extracted video ID from URL:", videoId);
+    } else if (videoId) {
+      console.log("Processing chat with provided video ID:", videoId);
     }
+
+    if (!videoId) {
+      console.error("No videoId or URL provided");
+      return NextResponse.json(
+        { error: "No videoId or URL provided" },
+        { status: 400 }
+      );
+    }
+
+    console.log("Question:", question);
 
     if (!question) {
       console.error("No question provided");
@@ -38,21 +62,6 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
-
-    // Extract video ID from URL
-    const videoId = url.match(
-      /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/))([^&?\s]+)/
-    )?.[1];
-
-    if (!videoId) {
-      console.error("Invalid YouTube URL:", url);
-      return NextResponse.json(
-        { error: "Invalid YouTube URL" },
-        { status: 400 }
-      );
-    }
-
-    console.log("Extracted video ID:", videoId);
 
     // Get transcript
     try {
