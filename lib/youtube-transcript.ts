@@ -365,23 +365,32 @@ async function extractAndParseTranscriptFromHtml(
               }
             }
 
+            let dataToParse = matchedData;
             try {
-              parsed = JSON.parse(matchedData);
+              if (pattern.source.includes("ytInitialData")) {
+                // Pre-process specifically for ytInitialData:
+                // Replace unescaped newlines within potential string values.
+                dataToParse = dataToParse
+                  .replace(/(?<!\\)\n/g, "\\\\n")
+                  .replace(/(?<!\\)\r/g, "\\\\r");
+              }
+              parsed = JSON.parse(dataToParse);
             } catch (e: any) {
               if (pattern.source.includes("ytInitialData")) {
                 console.error(
                   `[${videoId}] Failed to parse ytInitialData. Error: ${e.message}`
                 );
-                const errorPositionMatch = e.message.match(/position\s+(\d+)/);
+                const errorPositionMatch =
+                  e.message.match(/position\\s+(\\d+)/);
                 if (errorPositionMatch && errorPositionMatch[1]) {
                   const errorPos = parseInt(errorPositionMatch[1], 10);
-                  const contextChars = 100; // Number of characters before and after the error position
+                  const contextChars = 100;
                   const startIndex = Math.max(0, errorPos - contextChars);
                   const endIndex = Math.min(
-                    matchedData.length,
+                    dataToParse.length,
                     errorPos + contextChars
                   );
-                  const errorContext = matchedData.substring(
+                  const errorContext = dataToParse.substring(
                     startIndex,
                     endIndex
                   );
@@ -389,14 +398,14 @@ async function extractAndParseTranscriptFromHtml(
                     `[${videoId}] Raw data around error (pos ${errorPos}): ...${errorContext}...`
                   );
                   console.error(
-                    `[${videoId}] Total length of matchedData for ytInitialData: ${matchedData.length}`
+                    `[${videoId}] Total length of matchedData for ytInitialData: ${dataToParse.length}`
                   );
                 } else {
                   console.error(
                     `[${videoId}] Could not extract error position from message: ${e.message}`
                   );
                   console.error(
-                    `[${videoId}] Full matchedData for ytInitialData (first 500 chars): ${matchedData.substring(
+                    `[${videoId}] Full matchedData for ytInitialData (first 500 chars): ${dataToParse.substring(
                       0,
                       500
                     )}`
@@ -413,7 +422,8 @@ async function extractAndParseTranscriptFromHtml(
                   50
                 )}, trying with additional cleaning`
               );
-              matchedData = matchedData
+              let retryData = matchedData;
+              retryData = retryData
                 .replace(/\n/g, "")
                 .replace(/\r/g, "")
                 .replace(/\t/g, "")
@@ -422,29 +432,19 @@ async function extractAndParseTranscriptFromHtml(
                 );
 
               // Try replacing escaped backslashes and quotes more thoroughly
-              matchedData = matchedData
+              retryData = retryData
                 .replace(/\\\\"/g, '"')
                 .replace(/\\"/g, '"')
                 .replace(/\\\\/g, "\\");
 
               try {
-                parsed = JSON.parse(matchedData);
-              } catch (e2) {
-                console.warn(
-                  `[${videoId}] Second parse attempt also failed: ${e2}`
-                );
-                // One more attempt with even more aggressive cleaning
-                try {
-                  matchedData = matchedData
-                    .replace(/[\\]+"/g, '"')
-                    .replace(/[\\]+/g, "\\");
-                  parsed = JSON.parse(matchedData);
-                } catch (e3) {
-                  console.warn(
-                    `[${videoId}] Third parse attempt failed: ${e3}`
-                  );
-                  throw e; // Throw the original error
-                }
+                retryData = retryData
+                  .replace(/[\\]+"/g, '"')
+                  .replace(/[\\]+/g, "\\");
+                parsed = JSON.parse(retryData);
+              } catch (e3) {
+                console.warn(`[${videoId}] Third parse attempt failed: ${e3}`);
+                throw e; // Throw the original error
               }
             }
 
