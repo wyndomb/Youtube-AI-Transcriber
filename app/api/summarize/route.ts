@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 // Replace the youtube-transcript npm package with our custom implementation
 // import { YoutubeTranscript, TranscriptConfig } from "youtube-transcript";
 import { fetchTranscript, TranscriptLine } from "@/lib/youtube-transcript";
@@ -7,15 +7,9 @@ import { fetchMetadataFromYouTubeAPI } from "@/lib/youtube";
 import { PodcastMetadata } from "@/components/PodcastMetadata";
 import { extractVideoId } from "@/lib/utils";
 
-// Check if OpenAI API key is set
-if (!process.env.OPENAI_API_KEY) {
-  console.error("OPENAI_API_KEY is not set in environment variables");
-  throw new Error("OPENAI_API_KEY is not set in environment variables");
-}
+// OpenAI API key check and client instantiation are handled by the imported '@/lib/openai'.
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const MAX_TOKENS_TRANSCRIPT = 100000; // Max tokens for transcript (approx 25k words)
 
 // Define a simple type for oEmbed response (can be shared or redefined)
 interface OEmbedResponse {
