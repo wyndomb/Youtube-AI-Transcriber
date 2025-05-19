@@ -368,7 +368,7 @@ async function extractAndParseTranscriptFromHtml(
             try {
               parsed = JSON.parse(matchedData);
             } catch (e: any) {
-              if (pattern.source === "ytInitialDatas*=s*({.*?});") {
+              if (pattern.source.includes("ytInitialData")) {
                 console.error(
                   `[${videoId}] Failed to parse ytInitialData. Error: ${e.message}`
                 );
