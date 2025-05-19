@@ -25,6 +25,9 @@ function parseTimestamp(timestamp: string): number {
 }
 
 // Enhanced headers to better mimic a real browser
+// Note: These headers, especially User-Agent and sec-ch-ua, may need periodic review
+// and updates to match the latest versions of common browsers (e.g., Chrome)
+// to maintain compatibility with sites like YouTube that might check them.
 const getBrowserLikeHeaders = () => {
   return {
     "User-Agent":
@@ -298,18 +301,19 @@ async function extractAndParseTranscriptFromHtml(
     for (const pattern of patterns) {
       const match = html.match(pattern);
       if (match && match[1]) {
-        let matchedData = match[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+        const rawMatchOne = match[1]; // Store raw match
+        let matchedData; // Will hold the (conditionally) cleaned version
 
-        // Handle URL encoded JSON (common in player_response)
         if (
-          pattern.source.includes("player_response") ||
-          pattern.source.includes("CAPTION_TRACKS_RESPONSE")
+          pattern.source.includes("ytInitialData") ||
+          pattern.source.includes("ytInitialPlayerResponse")
         ) {
-          try {
-            matchedData = decodeURIComponent(matchedData);
-          } catch (e) {
-            console.warn(`[${videoId}] Failed to decode URI component: ${e}`);
-          }
+          // For full JSON objects, only unescape literal backslashes.
+          // Avoid converting '\\"' to '"' which corrupts JSON strings.
+          matchedData = rawMatchOne.replace(/\\\\/g, "\\");
+        } else {
+          // Original generic cleaning for other patterns (e.g., escaped strings)
+          matchedData = rawMatchOne.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
         }
 
         console.log(
@@ -352,27 +356,17 @@ async function extractAndParseTranscriptFromHtml(
           }
         } else {
           // Attempt to parse as JSON for other patterns
+          let parsed: any; // Declare parsed here
+
           try {
-            // Enhanced JSON parsing with better error handling
-            let parsed;
-
-            // Handle escaped JSON strings
-            if (matchedData.startsWith('"') && matchedData.endsWith('"')) {
-              try {
-                matchedData = JSON.parse(matchedData);
-              } catch (e) {
-                console.warn(`[${videoId}] Failed to parse JSON string: ${e}`);
-              }
-            }
-
             let dataToParse = matchedData;
             try {
               if (pattern.source.includes("ytInitialData")) {
                 // Pre-process specifically for ytInitialData:
                 // Replace unescaped newlines within potential string values.
                 dataToParse = dataToParse
-                  .replace(/(?<!\\)\n/g, "\\\\n")
-                  .replace(/(?<!\\)\r/g, "\\\\r");
+                  .replace(/(?<!\\)\\n/g, "\\\\n")
+                  .replace(/(?<!\\)\\r/g, "\\\\r");
               }
               parsed = JSON.parse(dataToParse);
             } catch (e: any) {
@@ -579,7 +573,9 @@ async function extractAndParseTranscriptFromHtml(
     );
     // Log a snippet of the HTML for debugging
     console.error(`[${videoId}] HTML snippet: ${html.substring(0, 500)}...`);
-    return null;
+    throw new Error(
+      "Transcript data missing: No captions data found in HTML patterns."
+    );
   }
 
   let captionsData;
@@ -608,7 +604,9 @@ async function extractAndParseTranscriptFromHtml(
     console.warn(
       `[${videoId}] Parsed captions data lacks track information or is empty.`
     );
-    throw new Error("Transcript tracks unavailable or disabled in parsed data");
+    throw new Error(
+      "Transcript data missing: Parsed data lacks track information."
+    );
   }
 
   // Find the first usable transcript URL (prefer 'en' if available, otherwise take first)
@@ -622,7 +620,9 @@ async function extractAndParseTranscriptFromHtml(
     console.error(
       `[${videoId}] Could not find a valid baseUrl in caption tracks.`
     );
-    throw new Error("No valid transcript URL found in caption tracks");
+    throw new Error(
+      "Transcript data missing: No valid transcript URL in parsed tracks."
+    );
   }
 
   // Add necessary URL parameters if they're missing
@@ -827,7 +827,9 @@ async function extractAndParseTranscriptFromHtml(
         )}...`
       );
     }
-    throw new Error("Failed to parse transcript XML/TTML content");
+    throw new Error(
+      "Transcript data missing: Failed to parse XML/TTML content."
+    );
   }
 
   console.log(
@@ -1196,7 +1198,9 @@ async function fetchTranscriptInnertube(
       console.error(
         `[${videoId}] Could not find a valid baseUrl in Innertube caption tracks.`
       );
-      return null; // Or throw
+      throw new Error(
+        "Transcript data missing: No valid baseUrl in Innertube tracks."
+      );
     }
     console.log(
       `[${videoId}] Using Innertube transcript URL: ${transcriptUrl.substring(
@@ -1486,13 +1490,20 @@ export async function fetchTranscript(
   // If we get here, all methods failed
   if (lastError) {
     // Check errors for specific patterns
-    if (
+    if (lastError.message.includes("Transcript data missing:")) {
+      console.error(
+        `[${videoId}] A transcript data missing error occurred: ${lastError.message}`
+      );
+      throw new Error(
+        "This video doesn't have captions or has disabled captions. Consider using a video with captions or a different video."
+      );
+    } else if (
       lastError.message.includes("No captions data found") ||
       lastError.message.includes("No valid transcript URL found") ||
       lastError.message.includes("Transcript tracks unavailable")
     ) {
       console.error(
-        `[${videoId}] This video doesn't appear to have captions available.`
+        `[${videoId}] This video doesn't appear to have captions available (old check). Error: ${lastError.message}`
       );
       throw new Error(
         "This video doesn't have captions or has disabled captions. Consider using a video with captions or a different video."

@@ -896,12 +896,18 @@ async function fetchYouTubeTranscriptViaInnertubeAPI(videoId: string) {
  * Handles POST requests to summarize a YouTube video
  */
 export async function POST(request: Request) {
+  let videoIdForLog: string = "unknown_id_at_start"; // For logging in catch block
+
   try {
     // Extract the videoId from the request body
     let reqData;
     try {
       reqData = await request.json();
     } catch (error) {
+      console.error(
+        `[${videoIdForLog}] Invalid request body for summarize:`,
+        error
+      );
       return NextResponse.json(
         { error: "Invalid request body" },
         { status: 400 }
@@ -915,10 +921,11 @@ export async function POST(request: Request) {
     if (!videoId && reqData.url) {
       try {
         videoId = extractVideoId(reqData.url);
+        videoIdForLog = videoId || "unknown_id_after_extraction"; // Update for logging
         console.log(`Extracted videoId ${videoId} from URL ${reqData.url}`);
       } catch (error) {
         console.error(
-          `Failed to extract videoId from URL: ${reqData.url}`,
+          `[${videoIdForLog}] Failed to extract videoId from URL: ${reqData.url}`,
           error
         );
         return NextResponse.json(
@@ -926,22 +933,27 @@ export async function POST(request: Request) {
           { status: 400 }
         );
       }
+    } else if (videoId) {
+      videoIdForLog = videoId; // Update if videoId was directly provided
     }
 
     if (!videoId) {
-      console.error("Missing videoId parameter and no URL provided");
+      console.error(
+        `[${videoIdForLog}] Missing videoId parameter and no URL provided for summarize`
+      );
       return NextResponse.json(
         { error: "Missing videoId parameter" },
         { status: 400 }
       );
     }
+    // At this point, videoId is valid and videoIdForLog is set to it.
 
-    console.log(`Summarizing video with ID: ${videoId}`);
+    console.log(`Summarizing video with ID: ${videoIdForLog}`);
 
     // Fetch video metadata and transcript in parallel
     const [metadata, transcript] = await Promise.all([
-      fetchMetadataFromYouTubeAPI(videoId),
-      fetchTranscript(videoId),
+      fetchMetadataFromYouTubeAPI(videoId), // Use actual videoId for operations
+      fetchTranscript(videoId), // Use actual videoId for operations
     ]);
 
     // Check if we could get the metadata
@@ -1075,11 +1087,36 @@ export async function POST(request: Request) {
       },
     });
   } catch (error: any) {
-    console.error("Error in summarize API:", error);
-    return NextResponse.json(
-      { error: error.message || "Failed to summarize video" },
-      { status: 500 }
+    // Now use videoIdForLog in the catch block
+    console.error(
+      `Error in summarize API for videoId (${videoIdForLog}):`,
+      error
     );
+
+    // Check for specific user-friendly error from fetchTranscript
+    if (
+      error.message?.includes(
+        "This video doesn't have captions or has disabled captions"
+      )
+    ) {
+      console.warn(
+        `[${videoIdForLog}] Transcript explicitly unavailable for summarization: ${error.message}`
+      );
+      return NextResponse.json(
+        { error: error.message }, // Send the specific user-friendly message
+        { status: 404 } // Use 404 to indicate resource (captions) not found or disallowed
+      );
+    } else {
+      // Generic error for other failures
+      return NextResponse.json(
+        {
+          error:
+            error.message ||
+            "Failed to summarize video due to an unknown error",
+        },
+        { status: 500 }
+      );
+    }
   }
 }
 
